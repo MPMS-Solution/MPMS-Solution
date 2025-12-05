@@ -1,92 +1,70 @@
-##########################
-# LOAD EXISTING SSH KEYPAIR
-##########################
+terraform {
+  required_version = ">= 1.0"
 
-data "openstack_compute_keypair_v2" "ssh_key" {
-  name = var.ssh_key_name
-}
-
-##########################
-# FIND UBUNTU IMAGE AUTOMATICALLY
-##########################
-
-data "openstack_images_image_v2" "ubuntu" {
-  most_recent = true
-
-  properties = {
-    os_distro = "ubuntu"
+  required_providers {
+    openstack = {
+      source  = "terraform-provider-openstack/openstack"
+      version = "~> 1.53"
+    }
   }
 }
+provider "openstack" {
+  auth_url    = "http://10.202.22.253:5000/v3"
+  user_name   = "salah"
+  password    = "salah"
+  domain_name = "Default"
+  region      = "RegionOne"
+  tenant_name = "salah"
+}
 
-##########################
-# SECURITY GROUP
-##########################
-
+# Security group
 resource "openstack_networking_secgroup_v2" "k8s_secgroup" {
   name        = "k8s-secgroup"
   description = "Security group for Kubernetes cluster"
 }
 
-locals {
-  k8s_ports = [
-    { port = 22,    proto = "tcp" },
-    { port = 6443,  proto = "tcp" },
-    { port = 2379,  proto = "tcp" },
-    { port = 2380,  proto = "tcp" },
-    { port = 10250, proto = "tcp" }
-  ]
-}
-
-resource "openstack_networking_secgroup_rule_v2" "k8s_rules" {
-  for_each = { for p in local.k8s_ports : p.port => p }
-
+resource "openstack_networking_secgroup_rule_v2" "ssh" {
   direction         = "ingress"
   ethertype         = "IPv4"
-  protocol          = each.value.proto
-  port_range_min    = each.value.port
-  port_range_max    = each.value.port
+  protocol          = "tcp"
+  port_range_min    = 22
+  port_range_max    = 22
+  remote_ip_prefix  = "0.0.0.0/0"
   security_group_id = openstack_networking_secgroup_v2.k8s_secgroup.id
 }
 
-#######################################
-# CONTROL PLANE VM
-#######################################
-
-resource "openstack_compute_instance_v2" "cp1" {
-  name        = "cp1"
-  image_id    = data.openstack_images_image_v2.ubuntu.id
-  flavor_name = var.flavor_name
-  key_pair    = var.ssh_key_name
+# Control Plane
+resource "openstack_compute_instance_v2" "master" {
+  name       = "k8s-master"
+  image_name = "Ubuntu-22.04-MLOPINTO"
+  flavor_name = "m1.small"
+  key_pair    = "salah2-key"
+  security_groups = [openstack_networking_secgroup_v2.k8s_secgroup.name]
 
   network {
-    name = var.network_name
+    name = "public"
   }
 
+  user_data = templatefile("${path.module}/cloudinit-master.yaml", {
+    SSH_PUB_KEY = var.ssh_pub_key
+    POD_CIDR    = var.pod_cidr
+    K8S_VERSION = var.k8s_version
+  })
+}
+
+# Worker Node
+resource "openstack_compute_instance_v2" "worker" {
+  name       = "k8s-worker"
+  image_name = "Ubuntu-22.04-MLOPINTO"
+  flavor_name = "m1.small"
+  key_pair    = "salah2-key"
   security_groups = [openstack_networking_secgroup_v2.k8s_secgroup.name]
-}
-
-resource "openstack_networking_floatingip_v2" "cp1_fip" {
-  pool = "public"
-}
-
-resource "openstack_networking_floatingip_associate_v2" "cp1_attach" {
-  floating_ip = openstack_networking_floatingip_v2.cp1_fip.address
-  port_id     = openstack_compute_instance_v2.cp1.network[0].port
-}
-
-#######################################
-# WORKER VM
-#######################################
-
-resource "openstack_compute_instance_v2" "worker1" {
-  name        = "worker1"
-  image_id    = data.openstack_images_image_v2.ubuntu.id
-  flavor_name = var.flavor_name
-  key_pair    = var.ssh_key_name
 
   network {
-    name = var.network_name
+    name = "public"
   }
 
-  security_groups = [openstack_networking_secgroup_v2.k8s_secgroup.name]
+  user_data = templatefile("${path.module}/cloudinit-worker.yaml", {
+    SSH_PUB_KEY = var.ssh_pub_key
+  })
 }

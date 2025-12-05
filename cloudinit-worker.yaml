@@ -1,0 +1,16 @@
+#cloud-config
+package_update: true
+package_upgrade: true
+packages:
+  - apt-transport-https
+  - ca-certificates
+  - curl
+  - software-properties-common
+  - gnupg2
+
+runcmd:
+  - curl -fsSL https://packages.cloud.google.com/apt/doc/apt-key.gpg | apt-key add -
+  - add-apt-repository "deb https://apt.kubernetes.io/ kubernetes-xenial main"
+  - apt update
+  - apt install -y kubelet kubeadm kubectl
+  - bash -c 'kubeadm join $(curl -s http://169.254.169.254/latest/meta-data/local-ipv4):6443 --token $(cat /tmp/k8s_join_token) --discovery-token-ca-cert-hash sha256:$(cat /tmp/k8s_join_hash)'

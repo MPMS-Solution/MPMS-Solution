@@ -1,33 +1,16 @@
-variable "os_auth_url" {
-  default = "http://10.202.22.253:5000/v3"
+variable "ssh_pub_key" {
+  description = "Clé publique SSH pour se connecter aux VMs"
+  type        = string
 }
 
-variable "os_region" {
-  default = "RegionOne"
+variable "k8s_version" {
+  description = "Version de Kubernetes à installer"
+  type        = string
+  default     = "1.31.0"
 }
 
-variable "os_project_name" {
-  default = "salah"
-}
-
-variable "os_username" {
-  default = "salah"
-}
-
-variable "os_password" {}
-
-variable "ssh_key_name" {
-  default = "salah2-key"
-}
-
-variable "public_key_path" {
-  default = "~/.ssh/salah2-key.pub"
-}
-
-variable "flavor_name" {
-  default = "m1.medium"
-}
-
-variable "network_name" {
-  default = "private"
+variable "pod_cidr" {
+  description = "CIDR des pods"
+  type        = string
+  default     = "10.202.0.0/16"
 }
