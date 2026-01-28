@@ -118,7 +118,7 @@ resource "openstack_compute_instance_v2" "cp" {
   flavor_name = "m1.small"
   key_pair    = data.openstack_compute_keypair_v2.default.name
   image_id    = data.openstack_images_image_v2.ubuntu.id
-
+  config_drive = true
 
 
   network {
@@ -146,7 +146,7 @@ resource "openstack_compute_instance_v2" "worker" {
   flavor_name = "m1.small"
   key_pair    = data.openstack_compute_keypair_v2.default.name
   image_id    = data.openstack_images_image_v2.ubuntu.id
-
+  config_drive = true
 
 
   network {

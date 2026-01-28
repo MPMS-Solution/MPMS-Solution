@@ -17,34 +17,38 @@ runcmd:
   # Préparation système
   - swapoff -a
   - sed -i '/ swap / s/^/#/' /etc/fstab
+  
+  # Installation Docker/Containerd
   - curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /usr/share/keyrings/docker-archive-keyring.gpg
   - echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/docker-archive-keyring.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" | tee /etc/apt/sources.list.d/docker.list > /dev/null
   - apt-get update && apt-get install -y docker-ce docker-ce-cli containerd.io
   - containerd config default | tee /etc/containerd/config.toml
   - sed -i 's/SystemdCgroup = false/SystemdCgroup = true/g' /etc/containerd/config.toml
   - systemctl restart containerd
+  
+  # Installation Kubernetes
   - mkdir -p /etc/apt/keyrings
   - curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.30/deb/Release.key | gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
   - echo 'deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.30/deb/ ./' | tee /etc/apt/sources.list.d/kubernetes.list
   - apt-get update
   - apt-get install -y kubelet=1.30.14-* kubeadm=1.30.14-* kubectl=1.30.14-*
   - apt-mark hold kubelet kubeadm kubectl
+  
+  # Configuration réseau pour Kubernetes
   - echo -e "overlay\nbr_netfilter" > /etc/modules-load.d/k8s.conf
   - modprobe overlay && modprobe br_netfilter
   - echo -e "net.bridge.bridge-nf-call-ip6tables = 1\nnet.bridge.bridge-nf-call-iptables = 1\nnet.ipv4.ip_forward = 1" > /etc/sysctl.d/k8s.conf
   - sysctl --system
   - systemctl enable --now kubelet
-
+  
   # Initialisation du cluster HA
-  - IPADDR=$(hostname -I | awk '{print $1}')
-#  - kubeadm init --kubernetes-version=v1.30.14 --apiserver-advertise-address=$IPADDR --pod-network-cidr=10.244.0.0/16 --upload-certs --ignore-preflight-errors=all
   - kubeadm init --kubernetes-version=v1.30.14 --control-plane-endpoint "k8s-api.local:6443" --pod-network-cidr=10.244.0.0/16 --upload-certs --ignore-preflight-errors=all
-
+  
   # Config kubeconfig
   - mkdir -p /root/.kube && cp /etc/kubernetes/admin.conf /root/.kube/config
   - mkdir -p /home/ubuntu/.kube && cp /etc/kubernetes/admin.conf /home/ubuntu/.kube/config
   - chown ubuntu:ubuntu /home/ubuntu/.kube/config
-
+  
   # Génération des scripts de jointure
   - |
     CERT_KEY=$(kubeadm init phase upload-certs --upload-certs | tail -1)
@@ -52,10 +56,73 @@ runcmd:
     echo "$JOIN_CMD" > /root/join-worker.sh
     echo "$JOIN_CMD --control-plane --certificate-key $CERT_KEY" > /root/join-cp.sh
     chmod +x /root/join-worker.sh /root/join-cp.sh
-
+  
   # Installation Cilium
   - |
     export KUBECONFIG=/root/.kube/config
     curl -L --remote-name-all https://github.com/cilium/cilium-cli/releases/latest/download/cilium-linux-amd64.tar.gz
     tar -xzf cilium-linux-amd64.tar.gz -C /usr/local/bin
     /usr/local/bin/cilium install --version 1.16.5
+  
+  # Attendre que Cilium soit prêt
+  - |
+    export KUBECONFIG=/root/.kube/config
+    echo "Attente de Cilium..."
+    sleep 60
+    kubectl wait --for=condition=Ready pods -l app.kubernetes.io/part-of=cilium -n kube-system --timeout=300s || true
+  
+  # Installation MetalLB
+  - |
+    export KUBECONFIG=/root/.kube/config
+    echo "Installation de MetalLB..."
+    kubectl apply -f https://raw.githubusercontent.com/metallb/metallb/v0.14.9/config/manifests/metallb-native.yaml
+  
+  # Attendre que MetalLB soit prêt
+  - |
+    export KUBECONFIG=/root/.kube/config
+    echo "Attente du déploiement MetalLB..."
+    kubectl wait --namespace metallb-system --for=condition=available deployment/controller --timeout=300s || sleep 60
+    kubectl wait --namespace metallb-system --for=condition=ready pod -l app=metallb -n metallb-system --timeout=300s || sleep 30
+  
+  # Configuration MetalLB - IPAddressPool et L2Advertisement
+  - |
+    export KUBECONFIG=/root/.kube/config
+    echo "Configuration de MetalLB..."
+    cat <<'EOF' | kubectl apply -f -
+    apiVersion: metallb.io/v1beta1
+    kind: IPAddressPool
+    metadata:
+      name: default-pool
+      namespace: metallb-system
+    spec:
+      addresses:
+        - 10.202.20.10-10.202.20.20
+    ---
+    apiVersion: metallb.io/v1beta1
+    kind: L2Advertisement
+    metadata:
+      name: default-l2
+      namespace: metallb-system
+    spec:
+      ipAddressPools:
+        - default-pool
+    EOF
+  
+  # Créer un script de vérification MetalLB
+  - |
+    cat <<'EOF' > /root/check-metallb.sh
+    #!/bin/bash
+    export KUBECONFIG=/root/.kube/config
+    echo "=== MetalLB Status ==="
+    kubectl get pods -n metallb-system
+    echo ""
+    echo "=== IP Address Pool ==="
+    kubectl get ipaddresspool -n metallb-system
+    echo ""
+    echo "=== L2 Advertisement ==="
+    kubectl get l2advertisement -n metallb-system
+    EOF
+    chmod +x /root/check-metallb.sh
+  
+  # Marqueur de fin d'installation
+  - touch /root/cloud-init-complete

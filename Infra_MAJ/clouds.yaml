@@ -10,10 +10,10 @@ clouds:
   openstack:
     auth:
       auth_url: http://10.202.22.22:5000
-      username: "Marouane"
-      password: "marouaneÉ&À'"
-      project_id: ee4542d0663e4035bd050237daa8ad3b
-      project_name: "Marouane-projet"
+      username: "pierre"
+      password: "pierre1"
+      project_id: 83af1f45e02e46cc883fbc0047449e72
+      project_name: "pierre"
       user_domain_name: "Default"
     region_name: "RegionOne"
     interface: "public"
