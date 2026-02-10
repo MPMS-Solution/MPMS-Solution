@@ -1,0 +1,175 @@
+#cloud-config
+package_update: true
+package_upgrade: true
+packages:
+  - apt-transport-https
+  - ca-certificates
+  - curl
+  - gnupg
+  - arping
+
+write_files:
+  - path: /etc/hosts
+    content: |
+      127.0.0.1 localhost
+      ${control_plane_ip} k8s-api.local
+
+  - path: /root/traefik-values.yaml
+    content: |
+      ingressRoute:
+        dashboard:
+          enabled: false
+      service:
+        enabled: true
+        type: LoadBalancer
+      ports:
+        web:
+          port: 8000
+          exposedPort: 80
+        websecure:
+          port: 8443
+          exposedPort: 443
+
+  - path: /root/exemple-ingressroute.yaml
+    content: |
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: whoami
+      spec:
+        replicas: 2
+        selector:
+          matchLabels:
+            app: whoami
+        template:
+          metadata:
+            labels:
+              app: whoami
+          spec:
+            containers:
+              - name: whoami
+                image: traefik/whoami
+                ports:
+                  - containerPort: 80
+      ---
+      apiVersion: v1
+      kind: Service
+      metadata:
+        name: whoami
+      spec:
+        selector:
+          app: whoami
+        ports:
+          - port: 80
+            targetPort: 80
+
+runcmd:
+  # --- Système ---
+  - swapoff -a
+  - sed -i '/ swap / s/^/#/' /etc/fstab
+  
+  # --- Containerd ---
+  - curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /usr/share/keyrings/docker-archive-keyring.gpg
+  - echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/docker-archive-keyring.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" | tee /etc/apt/sources.list.d/docker.list > /dev/null
+  - apt-get update && apt-get install -y docker-ce docker-ce-cli containerd.io
+  - containerd config default | tee /etc/containerd/config.toml
+  - sed -i 's/SystemdCgroup = false/SystemdCgroup = true/g' /etc/containerd/config.toml
+  - systemctl restart containerd
+  
+  # --- Kubernetes ---
+  - mkdir -p /etc/apt/keyrings
+  - curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.30/deb/Release.key | gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+  - echo 'deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.30/deb/ ./' | tee /etc/apt/sources.list.d/kubernetes.list
+  - apt-get update
+  - apt-get install -y kubelet=1.30.14-* kubeadm=1.30.14-* kubectl=1.30.14-*
+  - apt-mark hold kubelet kubeadm kubectl
+  
+  # --- Réseau Kernel ---
+  - echo -e "overlay\nbr_netfilter" > /etc/modules-load.d/k8s.conf
+  - modprobe overlay && modprobe br_netfilter
+  - echo -e "net.bridge.bridge-nf-call-iptables = 1\nnet.ipv4.ip_forward = 1" > /etc/sysctl.d/k8s.conf
+  - sysctl --system
+  
+  # --- Initialisation Cluster ---
+  - kubeadm init --kubernetes-version=v1.30.14 --control-plane-endpoint "k8s-api.local:6443" --pod-network-cidr=10.244.0.0/16 --upload-certs --ignore-preflight-errors=all
+  
+  - mkdir -p /root/.kube && cp /etc/kubernetes/admin.conf /root/.kube/config
+  - mkdir -p /home/ubuntu/.kube && cp /etc/kubernetes/admin.conf /home/ubuntu/.kube/config
+  - chown ubuntu:ubuntu /home/ubuntu/.kube/config
+  
+  # --- Scripts pour Terraform ---
+  - |
+    CK=$(kubeadm init phase upload-certs --upload-certs | tail -1)
+    JD=$(kubeadm token create --print-join-command)
+    echo "$JD" > /root/join-worker.sh
+    echo "$JD --control-plane --certificate-key $CK" > /root/join-cp.sh
+    chmod +x /root/join-*.sh
+  
+  # --- Libération de Terraform ---
+  - touch /root/cloud-init-complete
+
+  # --- Installation des Services Kubernetes ---
+  - |
+    export KUBECONFIG=/root/.kube/config
+    
+    # Cilium
+    curl -L https://github.com/cilium/cilium-cli/releases/latest/download/cilium-linux-amd64.tar.gz | tar xz -C /usr/local/bin
+    cilium install --version 1.16.5
+    
+    # MetalLB
+    kubectl apply -f https://raw.githubusercontent.com/metallb/metallb/v0.14.9/config/manifests/metallb-native.yaml
+    sleep 30
+    kubectl delete validatingwebhookconfigurations.admissionregistration.k8s.io metallb-webhook-configuration || true
+    cat <<'EOF' | kubectl apply -f -
+    apiVersion: metallb.io/v1beta1
+    kind: IPAddressPool
+    metadata: { name: pool, namespace: metallb-system }
+    spec: { addresses: ["10.202.20.20-10.202.20.25"] }
+    ---
+    apiVersion: metallb.io/v1beta1
+    kind: L2Advertisement
+    metadata: { name: l2, namespace: metallb-system }
+    EOF
+
+    # Helm & Traefik
+    curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+    helm repo add traefik https://traefik.github.io/charts && helm repo update
+    helm install traefik traefik/traefik -n traefik --create-namespace --values /root/traefik-values.yaml
+    kubectl apply -f /root/exemple-ingressroute.yaml
+
+    # Rook-Ceph
+    git clone --branch v1.15.2 https://github.com/rook/rook.git /root/rook
+    cd /root/rook/deploy/examples
+    kubectl create -f common.yaml -f crds.yaml -f operator.yaml
+    cat <<EOF | kubectl apply -f -
+    apiVersion: ceph.rook.io/v1
+    kind: CephCluster
+    metadata: { name: rook-ceph, namespace: rook-ceph }
+    spec:
+      cephVersion: { image: quay.io/ceph/ceph:v18.2.4 }
+      dataDirHostPath: /var/lib/rook
+      mon: { count: 3 }
+      mgr: { count: 1 }
+      storage:
+        useAllNodes: true
+        useAllDevices: false
+        deviceFilter: "^vdb"
+    EOF
+
+    # Velero (Version Corrigée)
+    wget https://github.com/vmware-tanzu/velero/releases/download/v1.15.0/velero-v1.15.0-linux-amd64.tar.gz
+    tar -xvf velero-v1.15.0-linux-amd64.tar.gz && mv velero-v1.15.0-linux-amd64/velero /usr/local/bin/
+    cat <<EOF > /root/credentials-velero
+    [default]
+    aws_access_key_id = ${minio_access_key}
+    aws_secret_access_key = ${minio_secret_key}
+    EOF
+    velero install \
+      --provider aws \
+      --plugins velero/velero-plugin-for-aws:v1.9.2 \
+      --bucket velero \
+      --secret-file /root/credentials-velero \
+      --use-node-agent \
+      --backup-location-config region=minio,s3ForcePathStyle="true",s3Url=http://minio.velero.svc:9000 \
+      --use-volume-snapshots=false \
+      --wait
