@@ -1,6 +1,6 @@
 #cloud-config
 package_update: true
-package_upgrade: true
+package_upgrade: false
 packages:
   - apt-transport-https
   - ca-certificates
@@ -14,32 +14,33 @@ write_files:
     path: /etc/hosts
 
 runcmd:
-  # Préparation système
   - swapoff -a
   - sed -i '/ swap / s/^/#/' /etc/fstab
-  
-  # Installation Docker/Containerd
-  - curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /usr/share/keyrings/docker-archive-keyring.gpg
-  - echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/docker-archive-keyring.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" | tee /etc/apt/sources.list.d/docker.list > /dev/null
-  - apt-get update && apt-get install -y docker-ce docker-ce-cli containerd.io
-  - containerd config default | tee /etc/containerd/config.toml
-  - sed -i 's/SystemdCgroup = false/SystemdCgroup = true/g' /etc/containerd/config.toml
-  - systemctl restart containerd
-  
-  # Installation Kubernetes
-  - mkdir -p /etc/apt/keyrings
-  - curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.30/deb/Release.key | gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
-  - echo 'deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.30/deb/ ./' | tee /etc/apt/sources.list.d/kubernetes.list
-  - apt-get update
-  - apt-get install -y kubelet=1.30.14-* kubeadm=1.30.14-* kubectl=1.30.14-*
-  - apt-mark hold kubelet kubeadm kubectl
-  
-  # Configuration réseau pour Kubernetes
+  # Modules noyau et sysctl en premier (instantane)
   - echo -e "overlay\nbr_netfilter" > /etc/modules-load.d/k8s.conf
   - modprobe overlay && modprobe br_netfilter
   - echo -e "net.bridge.bridge-nf-call-ip6tables = 1\nnet.bridge.bridge-nf-call-iptables = 1\nnet.ipv4.ip_forward = 1" > /etc/sysctl.d/k8s.conf
   - sysctl --system
+  # Ajout des DEUX repos avant apt-get update
+  - curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /usr/share/keyrings/docker-archive-keyring.gpg
+  - |
+    ARCH=$(dpkg --print-architecture)
+    CODENAME=$(lsb_release -cs)
+    echo "deb [arch=$ARCH signed-by=/usr/share/keyrings/docker-archive-keyring.gpg] https://download.docker.com/linux/ubuntu $CODENAME stable" > /etc/apt/sources.list.d/docker.list
+  - mkdir -p /etc/apt/keyrings
+  - curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.30/deb/Release.key | gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+  - echo 'deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.30/deb/ /' > /etc/apt/sources.list.d/kubernetes.list
+  # Un seul apt-get update + install
+  - apt-get update
+  - apt-get install -y containerd.io kubelet=1.30.14-* kubeadm=1.30.14-* kubectl=1.30.14-*
+  - apt-mark hold kubelet kubeadm kubectl
+  # Configuration containerd
+  - containerd config default | tee /etc/containerd/config.toml
+  - sed -i 's/SystemdCgroup = false/SystemdCgroup = true/g' /etc/containerd/config.toml
+  - systemctl restart containerd
   - systemctl enable --now kubelet
+  - mkdir -p /var/lib/grafana
+  - chown 472:472 /var/lib/grafana
+  - chmod 755 /var/lib/grafana
   
-  # Marqueur de fin d'installation
   - touch /root/cloud-init-complete

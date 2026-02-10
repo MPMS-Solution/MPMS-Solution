@@ -1,0 +1,47 @@
+kubectl set env deployment/grafana -n grafana \
+  GF_SERVER_ROOT_URL='http://10.202.20.10/grafana' \
+  GF_SERVER_SERVE_FROM_SUB_PATH='true'
+
+# D'abord verifier le nom du deployment
+kubectl get deploy -n monitoring
+Puis (adapte le nom si different de prometheus-server) :
+
+
+kubectl patch deployment prometheus-server -n monitoring --type=json \
+  -p='[{"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--web.external-url=/prometheus"},{"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--web.route-prefix=/prometheus"}]'
+
+cat <<'EOF' | kubectl apply -f -
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: grafana-route
+  namespace: grafana
+spec:
+  entryPoints:
+    - web
+    - websecure
+  routes:
+    - kind: Rule
+      match: PathPrefix(`/grafana`)
+      services:
+        - name: grafana
+          port: 3000
+  tls: {}
+---
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: prometheus-route
+  namespace: monitoring
+spec:
+  entryPoints:
+    - web
+    - websecure
+  routes:
+    - kind: Rule
+      match: PathPrefix(`/prometheus`)
+      services:
+        - name: prometheus-service
+          port: 8080
+  tls: {}
+EOF

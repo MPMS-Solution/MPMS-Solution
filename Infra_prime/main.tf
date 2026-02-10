@@ -4,25 +4,21 @@ terraform {
       source  = "terraform-provider-openstack/openstack"
       version = "~> 1.53.0"
     }
-    time = {
-      source  = "hashicorp/time"
-      version = "~> 0.9.1"
-    }
   }
 }
 
 # --- Data Sources ---
 data "openstack_networking_network_v2" "public" {
-  name = "public"
+  name = var.network_name
 }
 
 data "openstack_images_image_v2" "ubuntu" {
   most_recent = true
-  name        = "Ubuntu-22.04"
+  name        = var.image_name
 }
 
 data "openstack_compute_keypair_v2" "default" {
-  name = "terraform"
+  name = var.keypair_name
 }
 
 # --- SECURITY GROUPS ---
@@ -37,7 +33,7 @@ resource "openstack_networking_secgroup_rule_v2" "ssh_rule" {
   protocol          = "tcp"
   port_range_min    = 22
   port_range_max    = 22
-  remote_ip_prefix  = "0.0.0.0/0"
+  remote_ip_prefix  = var.ssh_allowed_cidr
   security_group_id = openstack_networking_secgroup_v2.k8s_secgroup.id
 }
 
@@ -47,7 +43,7 @@ resource "openstack_networking_secgroup_rule_v2" "k8s_api_rule" {
   protocol          = "tcp"
   port_range_min    = 6443
   port_range_max    = 6443
-  remote_ip_prefix  = "0.0.0.0/0"
+  remote_ip_prefix  = var.k8s_api_allowed_cidr
   security_group_id = openstack_networking_secgroup_v2.k8s_secgroup.id
 }
 
@@ -88,45 +84,45 @@ resource "openstack_networking_secgroup_rule_v2" "icmp_rule" {
 
 # --- RÉSERVATION DES PORTS AVEC ALLOWED ADDRESS PAIRS (/16) ---
 resource "openstack_networking_port_v2" "cp_ports" {
-  count              = 3
+  count              = var.cp_count
   name               = "port-k8s-cp${count.index + 1}"
   network_id         = data.openstack_networking_network_v2.public.id
   security_group_ids = [openstack_networking_secgroup_v2.k8s_secgroup.id]
 
   allowed_address_pairs {
-    ip_address = "10.202.0.0/16"
+    ip_address = var.allowed_address_cidr
   }
 }
 
 resource "openstack_networking_port_v2" "worker_ports" {
-  count              = 3
+  count              = var.worker_count
   name               = "port-k8s-worker${count.index + 1}"
   network_id         = data.openstack_networking_network_v2.public.id
   security_group_ids = [openstack_networking_secgroup_v2.k8s_secgroup.id]
 
   allowed_address_pairs {
-    ip_address = "10.202.0.0/16"
+    ip_address = var.allowed_address_cidr
   }
-}
+} 
 
 # --- VOLUMES ---
 resource "openstack_blockstorage_volume_v3" "cp_data" {
-  count = 3
+  count = var.cp_count
   name  = "k8s-cp${count.index + 1}-data"
-  size  = 8
+  size  = var.volume_size
 }
 
 resource "openstack_blockstorage_volume_v3" "worker_data" {
-  count = 3
+  count = var.worker_count
   name  = "k8s-worker${count.index + 1}-data"
-  size  = 8
+  size  = var.volume_size
 }
 
 # --- CONTROL PLANES ---
 resource "openstack_compute_instance_v2" "cp" {
-  count        = 3
+  count        = var.cp_count
   name         = "k8s-cp${count.index + 1}"
-  flavor_name  = "m1.small"
+  flavor_name  = var.flavor_name
   key_pair     = data.openstack_compute_keypair_v2.default.name
   image_id     = data.openstack_images_image_v2.ubuntu.id
   config_drive = true
@@ -143,16 +139,16 @@ resource "openstack_compute_instance_v2" "cp" {
 }
 
 resource "openstack_compute_volume_attach_v2" "cp_volume_attach" {
-  count       = 3
+  count       = var.cp_count
   instance_id = openstack_compute_instance_v2.cp[count.index].id
   volume_id   = openstack_blockstorage_volume_v3.cp_data[count.index].id
 }
 
 # --- WORKER NODES ---
 resource "openstack_compute_instance_v2" "worker" {
-  count        = 3
+  count        = var.worker_count
   name         = "k8s-worker${count.index + 1}"
-  flavor_name  = "m1.small"
+  flavor_name  = var.flavor_name
   key_pair     = data.openstack_compute_keypair_v2.default.name
   image_id     = data.openstack_images_image_v2.ubuntu.id
   config_drive = true
@@ -167,64 +163,80 @@ resource "openstack_compute_instance_v2" "worker" {
 }
 
 resource "openstack_compute_volume_attach_v2" "worker_volume_attach" {
-  count       = 3
+  count       = var.worker_count
   instance_id = openstack_compute_instance_v2.worker[count.index].id
   volume_id   = openstack_blockstorage_volume_v3.worker_data[count.index].id
 }
 
-# --- DÉLAI D'ATTENTE ---
-resource "time_sleep" "wait_for_cp_boot" {
-  create_duration = "10m"
-  depends_on      = [openstack_compute_instance_v2.cp[0]]
-}
-
-# --- JOINTURE CP ---
-resource "null_resource" "cp_join" {
-  count      = 2
-  depends_on = [time_sleep.wait_for_cp_boot]
+# --- ATTENTE ACTIVE : SCRIPTS DE JOIN SUR CP1 ---
+resource "null_resource" "wait_for_cp1_join_scripts" {
+  depends_on = [openstack_compute_instance_v2.cp[0]]
 
   connection {
     type        = "ssh"
     user        = "ubuntu"
-    private_key = file("~/.ssh/id_ed25519")
-    host        = openstack_networking_port_v2.cp_ports[count.index + 1].all_fixed_ips[0]
-  }
-
-  provisioner "file" {
-    source      = "~/.ssh/id_ed25519"
-    destination = "/home/ubuntu/.ssh/id_ed25519"
+    private_key = file(var.ssh_private_key_path)
+    host        = openstack_networking_port_v2.cp_ports[0].all_fixed_ips[0]
+    timeout     = "10m"
   }
 
   provisioner "remote-exec" {
     inline = [
-      "chmod 600 /home/ubuntu/.ssh/id_ed25519",
-      "while ! ssh -i /home/ubuntu/.ssh/id_ed25519 -o StrictHostKeyChecking=no ubuntu@${openstack_networking_port_v2.cp_ports[0].all_fixed_ips[0]} 'sudo test -f /root/join-cp.sh'; do echo 'En attente du script sur CP1...'; sleep 10; done",
-      "ssh -i /home/ubuntu/.ssh/id_ed25519 -o StrictHostKeyChecking=no ubuntu@${openstack_networking_port_v2.cp_ports[0].all_fixed_ips[0]} 'sudo cat /root/join-cp.sh' | sed 's/kubeadm join/kubeadm join --ignore-preflight-errors=NumCPU/' | sudo bash"
+      "echo 'Connecte a CP1, attente des scripts de join...'",
+      "while ! sudo test -f /root/join-worker.sh || ! sudo test -f /root/join-cp.sh; do sleep 5; done",
+      "echo 'Scripts de join prets!'"
     ]
+  }
+}
+
+# --- JOINTURE CP ---
+resource "null_resource" "cp_join" {
+  count      = var.cp_count - 1
+  depends_on = [null_resource.wait_for_cp1_join_scripts]
+
+  connection {
+    type        = "ssh"
+    user        = "ubuntu"
+    private_key = file(var.ssh_private_key_path)
+    host        = openstack_networking_port_v2.cp_ports[count.index + 1].all_fixed_ips[0]
+    timeout     = "10m"
+  }
+
+  # Attente que cloud-init ait fini d'installer kubeadm sur ce noeud
+  provisioner "remote-exec" {
+    inline = [
+      "while ! sudo test -f /root/cloud-init-complete; do sleep 5; done"
+    ]
+  }
+
+  # Join via relay local (pas de distribution de cle SSH)
+  provisioner "local-exec" {
+    command = "ssh -o StrictHostKeyChecking=no -i ${var.ssh_private_key_path} ubuntu@${openstack_networking_port_v2.cp_ports[0].all_fixed_ips[0]} 'sudo cat /root/join-cp.sh' | sed 's/kubeadm join/kubeadm join --ignore-preflight-errors=NumCPU/' | ssh -o StrictHostKeyChecking=no -i ${var.ssh_private_key_path} ubuntu@${openstack_networking_port_v2.cp_ports[count.index + 1].all_fixed_ips[0]} 'sudo bash'"
   }
 }
 
 # --- JOINTURE WORKERS ---
 resource "null_resource" "worker_join" {
-  count      = 3
-  depends_on = [time_sleep.wait_for_cp_boot]
+  count      = var.worker_count
+  depends_on = [null_resource.wait_for_cp1_join_scripts]
 
   connection {
     type        = "ssh"
     user        = "ubuntu"
-    private_key = file("~/.ssh/id_ed25519")
+    private_key = file(var.ssh_private_key_path)
     host        = openstack_networking_port_v2.worker_ports[count.index].all_fixed_ips[0]
+    timeout     = "10m"
   }
 
-  provisioner "file" {
-    source      = "~/.ssh/id_ed25519"
-    destination = "/home/ubuntu/.ssh/id_ed25519"
-  }
-
+  # Attente que cloud-init ait fini d'installer kubeadm sur ce noeud
   provisioner "remote-exec" {
     inline = [
-      "chmod 600 /home/ubuntu/.ssh/id_ed25519",
-      "ssh -o StrictHostKeyChecking=no -i /home/ubuntu/.ssh/id_ed25519 ubuntu@${openstack_networking_port_v2.cp_ports[0].all_fixed_ips[0]} 'sudo cat /root/join-worker.sh' | sudo bash"
+      "while ! sudo test -f /root/cloud-init-complete; do sleep 5; done"
     ]
+  }
+
+  # Join via relay local (pas de distribution de cle SSH)
+  provisioner "local-exec" {
+    command = "ssh -o StrictHostKeyChecking=no -i ${var.ssh_private_key_path} ubuntu@${openstack_networking_port_v2.cp_ports[0].all_fixed_ips[0]} 'sudo cat /root/join-worker.sh' | ssh -o StrictHostKeyChecking=no -i ${var.ssh_private_key_path} ubuntu@${openstack_networking_port_v2.worker_ports[count.index].all_fixed_ips[0]} 'sudo bash'"
   }
 }

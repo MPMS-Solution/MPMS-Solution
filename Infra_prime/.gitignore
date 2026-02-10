@@ -1,0 +1,27 @@
+# Terraform state (contient des données sensibles)
+*.tfstate
+*.tfstate.backup
+
+# Répertoire de providers Terraform
+.terraform/
+
+# Credentials OpenStack
+clouds.yaml
+
+# Fichiers de crash Terraform
+crash.log
+crash.*.log
+
+# Fichiers de variables avec secrets
+*.tfvars
+*.tfvars.json
+
+# Override Terraform (utilisés localement)
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+
+# Clés SSH
+*.pem
+id_*

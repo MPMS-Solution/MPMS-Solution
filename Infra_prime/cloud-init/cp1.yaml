@@ -1,11 +1,13 @@
 #cloud-config
 package_update: true
-package_upgrade: true
+package_upgrade: false
+
 packages:
   - apt-transport-https
   - ca-certificates
   - curl
   - gnupg
+  - arping
 
 write_files:
   - content: |
@@ -104,71 +106,162 @@ write_files:
               - name: whoami
                 port: 80
     path: /root/exemple-ingressroute.yaml
-    
+
+  - content: |
+      controller:
+        replicas: 1
+      redis-ha:
+        enabled: true
+      server:
+        replicas: 1
+        service:
+          type: ClusterIP
+        ingress:
+          enabled: false
+      repoServer:
+        replicas: 1
+      applicationSet:
+        replicas: 1
+      configs:
+        params:
+          server.insecure: true
+          server.basehref: /argocd
+          server.rootpath: /argocd
+    path: /root/argocd-values.yaml
+
+  - content: |
+      #!/bin/bash
+      export KUBECONFIG=/root/.kube/config
+
+      echo "=========================================="
+      echo "        ÉTAT DU CLUSTER KUBERNETES       "
+      echo "=========================================="
+      echo ""
+      
+      echo "=== Nodes ==="
+      kubectl get nodes -o wide
+      echo ""
+      
+      echo "=== Cilium ==="
+      kubectl get pods -n kube-system -l app.kubernetes.io/part-of=cilium --no-headers | head -5
+      echo "... ($(kubectl get pods -n kube-system -l app.kubernetes.io/part-of=cilium --no-headers | wc -l) pods total)"
+      echo ""
+      
+      echo "=== MetalLB ==="
+      kubectl get pods -n metallb-system --no-headers
+      kubectl get ipaddresspool -n metallb-system
+      echo ""
+      
+      echo "=== Traefik ==="
+      kubectl get pods -n traefik
+      kubectl get svc -n traefik
+      echo ""
+      
+      echo "=== ArgoCD ==="
+      kubectl get pods -n argocd --no-headers | head -10
+      echo "... ($(kubectl get pods -n argocd --no-headers | wc -l) pods total)"
+      echo ""
+      
+      TRAEFIK_IP=$(kubectl get svc traefik -n traefik -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null)
+      if [ -n "$TRAEFIK_IP" ]; then
+        echo "=========================================="
+        echo "  ACCÈS AUX SERVICES"
+        echo "=========================================="
+        echo "  Traefik:  http://$TRAEFIK_IP"
+        echo "  Whoami:   http://$TRAEFIK_IP/whoami"
+        echo "  ArgoCD:   http://$TRAEFIK_IP/argocd/"
+        echo "  ArgoCD:   https://$TRAEFIK_IP/argocd/ (certificat auto-signé)"
+        echo ""
+        echo "  ArgoCD Login:"
+        echo "    Username: admin"
+        if [ -f /root/argocd-admin-password.txt ]; then
+          echo "    Password: $(cat /root/argocd-admin-password.txt)"
+        else
+          echo "    Password: kubectl get secret argocd-initial-admin-secret -n argocd -o jsonpath='{.data.password}' | base64 -d"
+        fi
+        echo "=========================================="
+      fi
+    path: /root/check-cluster.sh
+    permissions: '0755'
+
+  - content: |
+      #!/bin/bash
+      export KUBECONFIG=/root/.kube/config
+      TRAEFIK_IP=$(kubectl get svc traefik -n traefik -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+      ARGOCD_PWD=$(cat /root/argocd-admin-password.txt 2>/dev/null || kubectl get secret argocd-initial-admin-secret -n argocd -o jsonpath="{.data.password}" | base64 -d)
+      
+      echo "Connexion à ArgoCD..."
+      argocd login $TRAEFIK_IP --username admin --password "$ARGOCD_PWD" --insecure --grpc-web --grpc-web-root-path /argocd
+      
+      if [ -n "$1" ]; then
+        echo "Ajout du repo Git avec clé SSH..."
+        argocd repo add git@github.com:MPMS-Solution/MPMS-Solution.git --ssh-private-key-path "$1"
+      else
+        echo ""
+        echo "Pour ajouter le repo avec une clé SSH:"
+        echo "  ./configure-argocd-repo.sh /chemin/vers/cle_ssh"
+        echo ""
+        echo "Ou via l'interface web: http://$TRAEFIK_IP/argocd/"
+      fi
+    path: /root/configure-argocd-repo.sh
+    permissions: '0755'
+
 runcmd:
   - swapoff -a
   - sed -i '/ swap / s/^/#/' /etc/fstab
-  
-  - curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /usr/share/keyrings/docker-archive-keyring.gpg
-  - echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/docker-archive-keyring.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" | tee /etc/apt/sources.list.d/docker.list > /dev/null
-  - apt-get update && apt-get install -y docker-ce docker-ce-cli containerd.io
-  - containerd config default | tee /etc/containerd/config.toml
-  - sed -i 's/SystemdCgroup = false/SystemdCgroup = true/g' /etc/containerd/config.toml
-  - systemctl restart containerd
-  
-  - mkdir -p /etc/apt/keyrings
-  - curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.30/deb/Release.key | gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
-  - echo 'deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.30/deb/ ./' | tee /etc/apt/sources.list.d/kubernetes.list
-  - apt-get update
-  - apt-get install -y kubelet=1.30.14-* kubeadm=1.30.14-* kubectl=1.30.14-*
-  - apt-mark hold kubelet kubeadm kubectl
-  
+  # Modules noyau et sysctl en premier (instantane)
   - echo -e "overlay\nbr_netfilter" > /etc/modules-load.d/k8s.conf
   - modprobe overlay && modprobe br_netfilter
   - echo -e "net.bridge.bridge-nf-call-ip6tables = 1\nnet.bridge.bridge-nf-call-iptables = 1\nnet.ipv4.ip_forward = 1" > /etc/sysctl.d/k8s.conf
   - sysctl --system
+  # Ajout des DEUX repos avant apt-get update (un seul update au lieu de deux)
+  - curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /usr/share/keyrings/docker-archive-keyring.gpg
+  - |
+    ARCH=$(dpkg --print-architecture)
+    CODENAME=$(lsb_release -cs)
+    echo "deb [arch=$ARCH signed-by=/usr/share/keyrings/docker-archive-keyring.gpg] https://download.docker.com/linux/ubuntu $CODENAME stable" > /etc/apt/sources.list.d/docker.list
+  - mkdir -p /etc/apt/keyrings
+  - curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.30/deb/Release.key | gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+  - echo 'deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.30/deb/ /' > /etc/apt/sources.list.d/kubernetes.list
+  # Un seul apt-get update + install (containerd.io suffit, docker-ce inutile pour K8s)
+  - apt-get update
+  - apt-get install -y containerd.io kubelet=1.30.14-* kubeadm=1.30.14-* kubectl=1.30.14-*
+  - apt-mark hold kubelet kubeadm kubectl
+  # Configuration containerd
+  - containerd config default | tee /etc/containerd/config.toml
+  - sed -i 's/SystemdCgroup = false/SystemdCgroup = true/g' /etc/containerd/config.toml
+  - systemctl restart containerd
   - systemctl enable --now kubelet
-  
-  - kubeadm init --kubernetes-version=v1.30.14 --control-plane-endpoint "k8s-api.local:6443" --pod-network-cidr=10.244.0.0/16 --upload-certs --ignore-preflight-errors=all
-  
+  - kubeadm init --kubernetes-version=v1.30.14 --control-plane-endpoint "k8s-api.local:6443" --pod-network-cidr=10.244.0.0/16 --upload-certs --ignore-preflight-errors=NumCPU,Mem
   - mkdir -p /root/.kube && cp /etc/kubernetes/admin.conf /root/.kube/config
   - mkdir -p /home/ubuntu/.kube && cp /etc/kubernetes/admin.conf /home/ubuntu/.kube/config
   - chown ubuntu:ubuntu /home/ubuntu/.kube/config
-  
   - |
     CERT_KEY=$(kubeadm init phase upload-certs --upload-certs | tail -1)
     JOIN_CMD=$(kubeadm token create --print-join-command)
     echo "$JOIN_CMD" > /root/join-worker.sh
     echo "$JOIN_CMD --control-plane --certificate-key $CERT_KEY" > /root/join-cp.sh
     chmod +x /root/join-worker.sh /root/join-cp.sh
-  
   - |
     export KUBECONFIG=/root/.kube/config
     curl -L --remote-name-all https://github.com/cilium/cilium-cli/releases/latest/download/cilium-linux-amd64.tar.gz
     tar -xzf cilium-linux-amd64.tar.gz -C /usr/local/bin
     /usr/local/bin/cilium install --version 1.16.5
-  
   - |
     export KUBECONFIG=/root/.kube/config
-    echo "Attente de Cilium..."
-    sleep 60
+    sleep 30
     kubectl wait --for=condition=Ready pods -l app.kubernetes.io/part-of=cilium -n kube-system --timeout=300s || true
-  
   - |
     export KUBECONFIG=/root/.kube/config
-    echo "Installation de MetalLB..."
     kubectl apply -f https://raw.githubusercontent.com/metallb/metallb/v0.14.9/config/manifests/metallb-native.yaml
-  
   - |
     export KUBECONFIG=/root/.kube/config
-    echo "Attente du déploiement MetalLB..."
     kubectl wait --namespace metallb-system --for=condition=available deployment/controller --timeout=300s || sleep 60
-    kubectl wait --namespace metallb-system --for=condition=ready pod -l app=metallb -n metallb-system --timeout=300s || sleep 30
-  
   - |
     export KUBECONFIG=/root/.kube/config
-    echo "Configuration de MetalLB..."
-    cat <<'METALEOF' | kubectl apply -f -
+    idx=0
+    while [ $idx -lt 10 ]; do
+      if cat <<'METALEOF' | kubectl apply -f -
     apiVersion: metallb.io/v1beta1
     kind: IPAddressPool
     metadata:
@@ -187,79 +280,200 @@ runcmd:
       ipAddressPools:
         - default-pool
     METALEOF
-  
+      then
+        break
+      fi
+      idx=$((idx+1))
+      sleep 20
+    done
   - |
-    echo "Installation de Helm..."
-    curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
-  
+    idx=0
+    while [ $idx -lt 5 ]; do
+      if curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash; then break; fi
+      idx=$((idx+1))
+      sleep 20
+    done
   - |
     export KUBECONFIG=/root/.kube/config
-    echo "Installation de Traefik..."
     helm repo add traefik https://traefik.github.io/charts
     helm repo update
     kubectl create namespace traefik
-    helm install traefik traefik/traefik \
-      --namespace traefik \
-      --values /root/traefik-values.yaml \
-      --wait --timeout 5m
-
+    helm install traefik traefik/traefik --namespace traefik --values /root/traefik-values.yaml --wait --timeout 5m
   - |
     export KUBECONFIG=/root/.kube/config
-    echo "Application de l'IngressRoute Whoami (correctif 404)..."
     kubectl apply -f /root/exemple-ingressroute.yaml
-  
   - |
     export KUBECONFIG=/root/.kube/config
-    echo "Attente de l'IP Traefik via MetalLB..."
-    for i in {1..30}; do
+    idx=0
+    while [ $idx -lt 30 ]; do
       TRAEFIK_IP=$(kubectl get svc traefik -n traefik -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null)
       if [ -n "$TRAEFIK_IP" ]; then
-        echo "Traefik accessible sur: $TRAEFIK_IP"
-        # On force une annonce ARP pour OpenStack
         arping -c 2 -I ens3 $TRAEFIK_IP || true
         break
       fi
-      echo "Attente de l'IP... ($i/30)"
+      idx=$((idx+1))
       sleep 5
     done
-  
   - |
-    cat <<'CHECKEOF' > /root/check-cluster.sh
-    #!/bin/bash
     export KUBECONFIG=/root/.kube/config
+    kubectl create namespace argocd
+    helm repo add argo https://argoproj.github.io/argo-helm
+    helm repo update
+    helm install argocd argo/argo-cd --namespace argocd --values /root/argocd-values.yaml --wait --timeout 10m
+  - |
+    export KUBECONFIG=/root/.kube/config
+    cat <<'ARGOEOF' | kubectl apply -f -
+    apiVersion: traefik.io/v1alpha1
+    kind: IngressRoute
+    metadata:
+      name: argocd-server-http
+      namespace: argocd
+    spec:
+      entryPoints:
+        - web
+      routes:
+        - kind: Rule
+          match: PathPrefix(`/argocd`)
+          services:
+            - name: argocd-server
+              port: 80
+    ---
+    apiVersion: traefik.io/v1alpha1
+    kind: IngressRoute
+    metadata:
+      name: argocd-server-https
+      namespace: argocd
+    spec:
+      entryPoints:
+        - websecure
+      routes:
+        - kind: Rule
+          match: PathPrefix(`/argocd`)
+          services:
+            - name: argocd-server
+              port: 80
+      tls: {}
+    ARGOEOF
+  - |
+    export KUBECONFIG=/root/.kube/config
+    idx=0
+    while [ $idx -lt 20 ]; do
+      if kubectl get secret argocd-initial-admin-secret -n argocd > /dev/null 2>&1; then
+        ARGOCD_PWD=$(kubectl get secret argocd-initial-admin-secret -n argocd -o jsonpath="{.data.password}" | base64 -d)
+        echo "$ARGOCD_PWD" > /root/argocd-admin-password.txt
+        chmod 600 /root/argocd-admin-password.txt
+        break
+      fi
+      idx=$((idx+1))
+      sleep 10
+    done
+  - curl -sSL -o /usr/local/bin/argocd https://github.com/argoproj/argo-cd/releases/latest/download/argocd-linux-amd64
+  - chmod +x /usr/local/bin/argocd
+  - |
+    export KUBECONFIG=/root/.kube/config
+    echo "Configuration de l'accès Traefik pour Grafana et Prometheus..."
+    # On attend un peu que les namespaces existent si l'install est en cours
+    cat <<'MONITORINGEOF' | kubectl apply -f -
+    apiVersion: traefik.io/v1alpha1
+    kind: IngressRoute
+    metadata:
+      name: grafana-route
+      namespace: grafana
+    spec:
+      entryPoints:
+        - web
+      routes:
+        - kind: Rule
+          match: PathPrefix(`/grafana`)
+          services:
+            - name: grafana
+              port: 3000
+    ---
+    apiVersion: traefik.io/v1alpha1
+    kind: IngressRoute
+    metadata:
+      name: prometheus-route
+      namespace: monitoring
+    spec:
+      entryPoints:
+        - web
+      routes:
+        - kind: Rule
+          match: PathPrefix(`/prometheus`)
+          services:
+            - name: prometheus-service
+              port: 8080
+    MONITORINGEOF
+
+  - |
+    export KUBECONFIG=/root/.kube/config
+    echo "Automatisation du stockage local pour Grafana..."
     
-    echo "=========================================="
-    echo "        ÉTAT DU CLUSTER KUBERNETES       "
-    echo "=========================================="
-    echo ""
+    # 1. Création de la StorageClass
+    cat <<'SCEOF' | kubectl apply -f -
+    apiVersion: storage.k8s.io/v1
+    kind: StorageClass
+    metadata:
+      name: local-storage
+    provisioner: kubernetes.io/no-provisioner
+    volumeBindingMode: WaitForFirstConsumer
+    SCEOF
+
+    # 2. Attente qu'un worker soit prêt pour récupérer son nom
+    WORKER_NAME=""
+    while [ -z "$$WORKER_NAME" ]; do
+      WORKER_NAME=$$(kubectl get nodes -l node-role.kubernetes.io/control-plane!="" -o name | head -n 1 | cut -d'/' -f2)
+      [ -z "$$WORKER_NAME" ] && sleep 10
+    done
+
+    # 3. Création du PV et du PVC (en utilisant le nom du worker trouvé)
+    kubectl create ns grafana --dry-run=client -o yaml | kubectl apply -f -
     
-    echo "=== Nodes ==="
-    kubectl get nodes -o wide
-    echo ""
-    
-    echo "=== Cilium ==="
-    kubectl get pods -n kube-system -l app.kubernetes.io/part-of=cilium
-    echo ""
-    
-    echo "=== MetalLB ==="
-    kubectl get pods -n metallb-system
-    kubectl get ipaddresspool -n metallb-system
-    echo ""
-    
-    echo "=== Traefik ==="
-    kubectl get pods -n traefik
-    kubectl get svc -n traefik
-    echo ""
-    
+    cat <<PVEOF | kubectl apply -f -
+    apiVersion: v1
+    kind: PersistentVolume
+    metadata:
+      name: stockage-local-grafana
+    spec:
+      capacity:
+        storage: 2Gi
+      accessModes:
+        - ReadWriteOnce
+      persistentVolumeReclaimPolicy: Retain
+      storageClassName: local-storage
+      local:
+        path: /var/lib/grafana
+      nodeAffinity:
+        required:
+          nodeSelectorTerms:
+            - matchExpressions:
+                - key: kubernetes.io/hostname
+                  operator: In
+                  values:
+                    - $$WORKER_NAME
+    ---
+    apiVersion: v1
+    kind: PersistentVolumeClaim
+    metadata:
+      name: grafana-pvc
+      namespace: grafana
+    spec:
+      accessModes:
+        - ReadWriteOnce
+      storageClassName: local-storage
+      resources:
+        requests:
+          storage: 1Gi
+    PVEOF
+  - |
+    export KUBECONFIG=/root/.kube/config
     TRAEFIK_IP=$(kubectl get svc traefik -n traefik -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null)
     if [ -n "$TRAEFIK_IP" ]; then
-      echo "=========================================="
-      echo "  Traefik est accessible sur: $TRAEFIK_IP"
-      echo "  HTTP:  http://$TRAEFIK_IP"
-      echo "  HTTPS: https://$TRAEFIK_IP"
-      echo "=========================================="
+      echo "Forçage du rafraîchissement des routes Traefik..."
+      sleep 5
+      curl -s -o /dev/null http://$TRAEFIK_IP/whoami || true
+      curl -s -o /dev/null http://$TRAEFIK_IP/argocd/ || true
+      curl -sk -o /dev/null https://$TRAEFIK_IP/argocd/ || true
+      echo "Routes Traefik activées"
     fi
-    CHECKEOF
-    chmod +x /root/check-cluster.sh
-  
   - touch /root/cloud-init-complete
