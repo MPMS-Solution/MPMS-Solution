@@ -69,3 +69,9 @@ variable "k8s_api_allowed_cidr" {
   type        = string
   default     = "0.0.0.0/0"
 }
+
+variable "github_pat" {
+  description = "GitHub Personal Access Token pour ArgoCD (repo prive)"
+  type        = string
+  sensitive   = true
+}

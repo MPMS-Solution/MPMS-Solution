@@ -133,6 +133,7 @@ resource "openstack_compute_instance_v2" "cp" {
 
   user_data = count.index == 0 ? templatefile("${path.module}/cloud-init/cp1.yaml", {
     control_plane_ip = openstack_networking_port_v2.cp_ports[0].all_fixed_ips[0]
+    github_pat       = var.github_pat
     }) : templatefile("${path.module}/cloud-init/worker.yaml", {
     control_plane_ip = openstack_networking_port_v2.cp_ports[0].all_fixed_ips[0]
   })
@@ -202,14 +203,12 @@ resource "null_resource" "cp_join" {
     timeout     = "10m"
   }
 
-  # Attente que cloud-init ait fini d'installer kubeadm sur ce noeud
   provisioner "remote-exec" {
     inline = [
       "while ! sudo test -f /root/cloud-init-complete; do sleep 5; done"
     ]
   }
 
-  # Join via relay local (pas de distribution de cle SSH)
   provisioner "local-exec" {
     command = "ssh -o StrictHostKeyChecking=no -i ${var.ssh_private_key_path} ubuntu@${openstack_networking_port_v2.cp_ports[0].all_fixed_ips[0]} 'sudo cat /root/join-cp.sh' | sed 's/kubeadm join/kubeadm join --ignore-preflight-errors=NumCPU/' | ssh -o StrictHostKeyChecking=no -i ${var.ssh_private_key_path} ubuntu@${openstack_networking_port_v2.cp_ports[count.index + 1].all_fixed_ips[0]} 'sudo bash'"
   }
@@ -228,14 +227,12 @@ resource "null_resource" "worker_join" {
     timeout     = "10m"
   }
 
-  # Attente que cloud-init ait fini d'installer kubeadm sur ce noeud
   provisioner "remote-exec" {
     inline = [
       "while ! sudo test -f /root/cloud-init-complete; do sleep 5; done"
     ]
   }
 
-  # Join via relay local (pas de distribution de cle SSH)
   provisioner "local-exec" {
     command = "ssh -o StrictHostKeyChecking=no -i ${var.ssh_private_key_path} ubuntu@${openstack_networking_port_v2.cp_ports[0].all_fixed_ips[0]} 'sudo cat /root/join-worker.sh' | ssh -o StrictHostKeyChecking=no -i ${var.ssh_private_key_path} ubuntu@${openstack_networking_port_v2.worker_ports[count.index].all_fixed_ips[0]} 'sudo bash'"
   }

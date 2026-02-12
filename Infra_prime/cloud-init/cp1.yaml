@@ -129,6 +129,106 @@ write_files:
           server.rootpath: /argocd
     path: /root/argocd-values.yaml
 
+  # ==============================================
+  # ArgoCD repo credentials (Secret avec PAT GitHub)
+  # Le label repo-creds fait qu'ArgoCD l'utilise
+  # automatiquement pour tout repo sous cette URL
+  # ==============================================
+  - content: |
+      apiVersion: v1
+      kind: Secret
+      metadata:
+        name: github-repo-creds
+        namespace: argocd
+        labels:
+          argocd.argoproj.io/secret-type: repo-creds
+      stringData:
+        type: git
+        url: https://github.com/PierreJaloghlian
+        username: PierreJaloghlian
+        password: ${github_pat}
+    path: /root/argocd-repo-creds.yaml
+    permissions: '0600'
+
+  # ==============================================
+  # ArgoCD Applications - GitOps monitoring stack
+  # ==============================================
+  - content: |
+      apiVersion: argoproj.io/v1alpha1
+      kind: AppProject
+      metadata:
+        name: monitoring
+        namespace: argocd
+      spec:
+        description: Monitoring stack (Grafana, Prometheus, kube-state-metrics)
+        sourceRepos:
+          - "https://github.com/PierreJaloghlian/SAE_Cloud_Openstack.git"
+        destinations:
+          - namespace: "*"
+            server: https://kubernetes.default.svc
+        clusterResourceWhitelist:
+          - group: "*"
+            kind: "*"
+      ---
+      apiVersion: argoproj.io/v1alpha1
+      kind: Application
+      metadata:
+        name: grafana
+        namespace: argocd
+      spec:
+        project: monitoring
+        source:
+          repoURL: https://github.com/PierreJaloghlian/SAE_Cloud_Openstack.git
+          targetRevision: main
+          path: grafana
+        destination:
+          server: https://kubernetes.default.svc
+        syncPolicy:
+          automated:
+            prune: true
+            selfHeal: true
+          syncOptions:
+            - CreateNamespace=true
+      ---
+      apiVersion: argoproj.io/v1alpha1
+      kind: Application
+      metadata:
+        name: prometheus
+        namespace: argocd
+      spec:
+        project: monitoring
+        source:
+          repoURL: https://github.com/PierreJaloghlian/SAE_Cloud_Openstack.git
+          targetRevision: main
+          path: prometheus
+        destination:
+          server: https://kubernetes.default.svc
+        syncPolicy:
+          automated:
+            prune: true
+            selfHeal: true
+          syncOptions:
+            - CreateNamespace=true
+      ---
+      apiVersion: argoproj.io/v1alpha1
+      kind: Application
+      metadata:
+        name: kube-state-metrics
+        namespace: argocd
+      spec:
+        project: monitoring
+        source:
+          repoURL: https://github.com/PierreJaloghlian/SAE_Cloud_Openstack.git
+          targetRevision: main
+          path: kube-state-metrics
+        destination:
+          server: https://kubernetes.default.svc
+        syncPolicy:
+          automated:
+            prune: true
+            selfHeal: true
+    path: /root/argocd-apps.yaml
+
   - content: |
       #!/bin/bash
       export KUBECONFIG=/root/.kube/config
@@ -161,16 +261,30 @@ write_files:
       kubectl get pods -n argocd --no-headers | head -10
       echo "... ($(kubectl get pods -n argocd --no-headers | wc -l) pods total)"
       echo ""
+
+      echo "=== ArgoCD Applications ==="
+      kubectl get applications -n argocd
+      echo ""
+
+      echo "=== Grafana ==="
+      kubectl get pods -n grafana 2>/dev/null || echo "  (pas encore déployé)"
+      echo ""
+
+      echo "=== Prometheus ==="
+      kubectl get pods -n monitoring 2>/dev/null || echo "  (pas encore déployé)"
+      echo ""
       
       TRAEFIK_IP=$(kubectl get svc traefik -n traefik -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null)
       if [ -n "$TRAEFIK_IP" ]; then
         echo "=========================================="
         echo "  ACCÈS AUX SERVICES"
         echo "=========================================="
-        echo "  Traefik:  http://$TRAEFIK_IP"
-        echo "  Whoami:   http://$TRAEFIK_IP/whoami"
-        echo "  ArgoCD:   http://$TRAEFIK_IP/argocd/"
-        echo "  ArgoCD:   https://$TRAEFIK_IP/argocd/ (certificat auto-signé)"
+        echo "  Traefik:     http://$TRAEFIK_IP"
+        echo "  Whoami:      http://$TRAEFIK_IP/whoami"
+        echo "  ArgoCD:      http://$TRAEFIK_IP/argocd/"
+        echo "  ArgoCD:      https://$TRAEFIK_IP/argocd/ (certificat auto-signé)"
+        echo "  Grafana:     http://$TRAEFIK_IP/grafana"
+        echo "  Prometheus:  http://$TRAEFIK_IP/prometheus"
         echo ""
         echo "  ArgoCD Login:"
         echo "    Username: admin"
@@ -179,42 +293,22 @@ write_files:
         else
           echo "    Password: kubectl get secret argocd-initial-admin-secret -n argocd -o jsonpath='{.data.password}' | base64 -d"
         fi
+        echo ""
+        echo "  Grafana Login:"
+        echo "    Username: admin"
+        echo "    Password: admin (change au premier login)"
         echo "=========================================="
       fi
     path: /root/check-cluster.sh
     permissions: '0755'
 
-  - content: |
-      #!/bin/bash
-      export KUBECONFIG=/root/.kube/config
-      TRAEFIK_IP=$(kubectl get svc traefik -n traefik -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
-      ARGOCD_PWD=$(cat /root/argocd-admin-password.txt 2>/dev/null || kubectl get secret argocd-initial-admin-secret -n argocd -o jsonpath="{.data.password}" | base64 -d)
-      
-      echo "Connexion à ArgoCD..."
-      argocd login $TRAEFIK_IP --username admin --password "$ARGOCD_PWD" --insecure --grpc-web --grpc-web-root-path /argocd
-      
-      if [ -n "$1" ]; then
-        echo "Ajout du repo Git avec clé SSH..."
-        argocd repo add git@github.com:MPMS-Solution/MPMS-Solution.git --ssh-private-key-path "$1"
-      else
-        echo ""
-        echo "Pour ajouter le repo avec une clé SSH:"
-        echo "  ./configure-argocd-repo.sh /chemin/vers/cle_ssh"
-        echo ""
-        echo "Ou via l'interface web: http://$TRAEFIK_IP/argocd/"
-      fi
-    path: /root/configure-argocd-repo.sh
-    permissions: '0755'
-
 runcmd:
   - swapoff -a
   - sed -i '/ swap / s/^/#/' /etc/fstab
-  # Modules noyau et sysctl en premier (instantane)
   - echo -e "overlay\nbr_netfilter" > /etc/modules-load.d/k8s.conf
   - modprobe overlay && modprobe br_netfilter
   - echo -e "net.bridge.bridge-nf-call-ip6tables = 1\nnet.bridge.bridge-nf-call-iptables = 1\nnet.ipv4.ip_forward = 1" > /etc/sysctl.d/k8s.conf
   - sysctl --system
-  # Ajout des DEUX repos avant apt-get update (un seul update au lieu de deux)
   - curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /usr/share/keyrings/docker-archive-keyring.gpg
   - |
     ARCH=$(dpkg --print-architecture)
@@ -223,11 +317,9 @@ runcmd:
   - mkdir -p /etc/apt/keyrings
   - curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.30/deb/Release.key | gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
   - echo 'deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.30/deb/ /' > /etc/apt/sources.list.d/kubernetes.list
-  # Un seul apt-get update + install (containerd.io suffit, docker-ce inutile pour K8s)
   - apt-get update
   - apt-get install -y containerd.io kubelet=1.30.14-* kubeadm=1.30.14-* kubectl=1.30.14-*
   - apt-mark hold kubelet kubeadm kubectl
-  # Configuration containerd
   - containerd config default | tee /etc/containerd/config.toml
   - sed -i 's/SystemdCgroup = false/SystemdCgroup = true/g' /etc/containerd/config.toml
   - systemctl restart containerd
@@ -242,6 +334,7 @@ runcmd:
     echo "$JOIN_CMD" > /root/join-worker.sh
     echo "$JOIN_CMD --control-plane --certificate-key $CERT_KEY" > /root/join-cp.sh
     chmod +x /root/join-worker.sh /root/join-cp.sh
+  # Cilium CNI
   - |
     export KUBECONFIG=/root/.kube/config
     curl -L --remote-name-all https://github.com/cilium/cilium-cli/releases/latest/download/cilium-linux-amd64.tar.gz
@@ -251,6 +344,7 @@ runcmd:
     export KUBECONFIG=/root/.kube/config
     sleep 30
     kubectl wait --for=condition=Ready pods -l app.kubernetes.io/part-of=cilium -n kube-system --timeout=300s || true
+  # MetalLB
   - |
     export KUBECONFIG=/root/.kube/config
     kubectl apply -f https://raw.githubusercontent.com/metallb/metallb/v0.14.9/config/manifests/metallb-native.yaml
@@ -286,6 +380,7 @@ runcmd:
       idx=$((idx+1))
       sleep 20
     done
+  # Helm
   - |
     idx=0
     while [ $idx -lt 5 ]; do
@@ -293,6 +388,7 @@ runcmd:
       idx=$((idx+1))
       sleep 20
     done
+  # Traefik
   - |
     export KUBECONFIG=/root/.kube/config
     helm repo add traefik https://traefik.github.io/charts
@@ -314,12 +410,14 @@ runcmd:
       idx=$((idx+1))
       sleep 5
     done
+  # ArgoCD install
   - |
     export KUBECONFIG=/root/.kube/config
     kubectl create namespace argocd
     helm repo add argo https://argoproj.github.io/argo-helm
     helm repo update
     helm install argocd argo/argo-cd --namespace argocd --values /root/argocd-values.yaml --wait --timeout 10m
+  # ArgoCD IngressRoutes
   - |
     export KUBECONFIG=/root/.kube/config
     cat <<'ARGOEOF' | kubectl apply -f -
@@ -354,6 +452,7 @@ runcmd:
               port: 80
       tls: {}
     ARGOEOF
+  # Récupérer le mot de passe ArgoCD
   - |
     export KUBECONFIG=/root/.kube/config
     idx=0
@@ -369,111 +468,42 @@ runcmd:
     done
   - curl -sSL -o /usr/local/bin/argocd https://github.com/argoproj/argo-cd/releases/latest/download/argocd-linux-amd64
   - chmod +x /usr/local/bin/argocd
+  # ====================================================
+  # BOOTSTRAP ARGOCD GITOPS
+  # 1. Secret avec PAT GitHub pour repo privé
+  # 2. Applications ArgoCD (Grafana, Prometheus, KSM)
+  # 3. Nettoyage du fichier contenant le PAT
+  # ====================================================
   - |
     export KUBECONFIG=/root/.kube/config
-    echo "Configuration de l'accès Traefik pour Grafana et Prometheus..."
-    # On attend un peu que les namespaces existent si l'install est en cours
-    cat <<'MONITORINGEOF' | kubectl apply -f -
-    apiVersion: traefik.io/v1alpha1
-    kind: IngressRoute
-    metadata:
-      name: grafana-route
-      namespace: grafana
-    spec:
-      entryPoints:
-        - web
-      routes:
-        - kind: Rule
-          match: PathPrefix(`/grafana`)
-          services:
-            - name: grafana
-              port: 3000
-    ---
-    apiVersion: traefik.io/v1alpha1
-    kind: IngressRoute
-    metadata:
-      name: prometheus-route
-      namespace: monitoring
-    spec:
-      entryPoints:
-        - web
-      routes:
-        - kind: Rule
-          match: PathPrefix(`/prometheus`)
-          services:
-            - name: prometheus-service
-              port: 8080
-    MONITORINGEOF
-
+    echo "Configuration des credentials du repo privé GitHub..."
+    kubectl apply -f /root/argocd-repo-creds.yaml
   - |
     export KUBECONFIG=/root/.kube/config
-    echo "Automatisation du stockage local pour Grafana..."
-    
-    # 1. Création de la StorageClass
-    cat <<'SCEOF' | kubectl apply -f -
-    apiVersion: storage.k8s.io/v1
-    kind: StorageClass
-    metadata:
-      name: local-storage
-    provisioner: kubernetes.io/no-provisioner
-    volumeBindingMode: WaitForFirstConsumer
-    SCEOF
-
-    # 2. Attente qu'un worker soit prêt pour récupérer son nom
-    WORKER_NAME=""
-    while [ -z "$$WORKER_NAME" ]; do
-      WORKER_NAME=$$(kubectl get nodes -l node-role.kubernetes.io/control-plane!="" -o name | head -n 1 | cut -d'/' -f2)
-      [ -z "$$WORKER_NAME" ] && sleep 10
+    echo "Déploiement des ArgoCD Applications..."
+    idx=0
+    while [ $idx -lt 10 ]; do
+      if kubectl apply -f /root/argocd-apps.yaml; then
+        echo "ArgoCD Applications créées avec succès!"
+        break
+      fi
+      idx=$((idx+1))
+      sleep 15
     done
-
-    # 3. Création du PV et du PVC (en utilisant le nom du worker trouvé)
-    kubectl create ns grafana --dry-run=client -o yaml | kubectl apply -f -
-    
-    cat <<PVEOF | kubectl apply -f -
-    apiVersion: v1
-    kind: PersistentVolume
-    metadata:
-      name: stockage-local-grafana
-    spec:
-      capacity:
-        storage: 2Gi
-      accessModes:
-        - ReadWriteOnce
-      persistentVolumeReclaimPolicy: Retain
-      storageClassName: local-storage
-      local:
-        path: /var/lib/grafana
-      nodeAffinity:
-        required:
-          nodeSelectorTerms:
-            - matchExpressions:
-                - key: kubernetes.io/hostname
-                  operator: In
-                  values:
-                    - $$WORKER_NAME
-    ---
-    apiVersion: v1
-    kind: PersistentVolumeClaim
-    metadata:
-      name: grafana-pvc
-      namespace: grafana
-    spec:
-      accessModes:
-        - ReadWriteOnce
-      storageClassName: local-storage
-      resources:
-        requests:
-          storage: 1Gi
-    PVEOF
+  # Nettoyage du PAT du disque (sécurité)
+  - rm -f /root/argocd-repo-creds.yaml
+  # Préparer le stockage local pour Grafana
+  - mkdir -p /var/lib/grafana
+  - chown 472:472 /var/lib/grafana
+  - chmod 755 /var/lib/grafana
+  # Rafraîchir les routes Traefik
   - |
     export KUBECONFIG=/root/.kube/config
     TRAEFIK_IP=$(kubectl get svc traefik -n traefik -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null)
     if [ -n "$TRAEFIK_IP" ]; then
-      echo "Forçage du rafraîchissement des routes Traefik..."
-      sleep 5
+      sleep 10
       curl -s -o /dev/null http://$TRAEFIK_IP/whoami || true
       curl -s -o /dev/null http://$TRAEFIK_IP/argocd/ || true
       curl -sk -o /dev/null https://$TRAEFIK_IP/argocd/ || true
-      echo "Routes Traefik activées"
     fi
   - touch /root/cloud-init-complete
