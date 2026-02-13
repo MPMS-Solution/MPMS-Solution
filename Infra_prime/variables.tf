@@ -75,3 +75,22 @@ variable "github_pat" {
   type        = string
   sensitive   = true
 }
+
+variable "rook_volume_size" {
+  description = "Taille des volumes Rook-Ceph en Go (un par worker)"
+  type        = number
+  default     = 20
+}
+
+variable "minio_access_key" {
+  description = "MinIO access key pour Velero"
+  type        = string
+  default     = "minioadmin"
+}
+
+variable "minio_secret_key" {
+  description = "MinIO secret key pour Velero"
+  type        = string
+  sensitive   = true
+  default     = "minioadmin"
+}

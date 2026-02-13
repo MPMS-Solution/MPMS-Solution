@@ -82,7 +82,7 @@ resource "openstack_networking_secgroup_rule_v2" "icmp_rule" {
   security_group_id = openstack_networking_secgroup_v2.k8s_secgroup.id
 }
 
-# --- RÉSERVATION DES PORTS AVEC ALLOWED ADDRESS PAIRS (/16) ---
+# --- PORTS ---
 resource "openstack_networking_port_v2" "cp_ports" {
   count              = var.cp_count
   name               = "port-k8s-cp${count.index + 1}"
@@ -103,7 +103,7 @@ resource "openstack_networking_port_v2" "worker_ports" {
   allowed_address_pairs {
     ip_address = var.allowed_address_cidr
   }
-} 
+}
 
 # --- VOLUMES ---
 resource "openstack_blockstorage_volume_v3" "cp_data" {
@@ -116,6 +116,13 @@ resource "openstack_blockstorage_volume_v3" "worker_data" {
   count = var.worker_count
   name  = "k8s-worker${count.index + 1}-data"
   size  = var.volume_size
+}
+
+# Volumes dédiés Rook-Ceph (un par worker, 20 Go)
+resource "openstack_blockstorage_volume_v3" "rook_data" {
+  count = var.worker_count
+  name  = "k8s-worker${count.index + 1}-rook"
+  size  = var.rook_volume_size
 }
 
 # --- CONTROL PLANES ---
@@ -134,6 +141,8 @@ resource "openstack_compute_instance_v2" "cp" {
   user_data = count.index == 0 ? templatefile("${path.module}/cloud-init/cp1.yaml", {
     control_plane_ip = openstack_networking_port_v2.cp_ports[0].all_fixed_ips[0]
     github_pat       = var.github_pat
+    minio_access_key = var.minio_access_key
+    minio_secret_key = var.minio_secret_key
     }) : templatefile("${path.module}/cloud-init/worker.yaml", {
     control_plane_ip = openstack_networking_port_v2.cp_ports[0].all_fixed_ips[0]
   })
@@ -167,6 +176,13 @@ resource "openstack_compute_volume_attach_v2" "worker_volume_attach" {
   count       = var.worker_count
   instance_id = openstack_compute_instance_v2.worker[count.index].id
   volume_id   = openstack_blockstorage_volume_v3.worker_data[count.index].id
+}
+
+# Volumes Rook-Ceph attachés aux workers
+resource "openstack_compute_volume_attach_v2" "rook_volume_attach" {
+  count       = var.worker_count
+  instance_id = openstack_compute_instance_v2.worker[count.index].id
+  volume_id   = openstack_blockstorage_volume_v3.rook_data[count.index].id
 }
 
 # --- ATTENTE ACTIVE : SCRIPTS DE JOIN SUR CP1 ---

@@ -8,6 +8,8 @@ packages:
   - curl
   - gnupg
   - arping
+  - lvm2
+  - git
 
 write_files:
   - content: |
@@ -80,16 +82,6 @@ write_files:
             targetPort: 80
       ---
       apiVersion: traefik.io/v1alpha1
-      kind: Middleware
-      metadata:
-        name: strip-whoami
-        namespace: default
-      spec:
-        stripPrefix:
-          prefixes:
-            - /whoami
-      ---
-      apiVersion: traefik.io/v1alpha1
       kind: IngressRoute
       metadata:
         name: whoami-route
@@ -99,14 +91,13 @@ write_files:
           - web
         routes:
           - kind: Rule
-            match: "PathPrefix(`/whoami`)"
-            middlewares:
-              - name: strip-whoami
+            match: Host(`whoami.mpms.lab`)
             services:
               - name: whoami
                 port: 80
     path: /root/exemple-ingressroute.yaml
 
+  # ArgoCD values - host-based routing, no basehref needed
   - content: |
       controller:
         replicas: 1
@@ -125,15 +116,9 @@ write_files:
       configs:
         params:
           server.insecure: true
-          server.basehref: /argocd
-          server.rootpath: /argocd
     path: /root/argocd-values.yaml
 
-  # ==============================================
   # ArgoCD repo credentials (Secret avec PAT GitHub)
-  # Le label repo-creds fait qu'ArgoCD l'utilise
-  # automatiquement pour tout repo sous cette URL
-  # ==============================================
   - content: |
       apiVersion: v1
       kind: Secret
@@ -150,9 +135,7 @@ write_files:
     path: /root/argocd-repo-creds.yaml
     permissions: '0600'
 
-  # ==============================================
   # ArgoCD Applications - GitOps monitoring stack
-  # ==============================================
   - content: |
       apiVersion: argoproj.io/v1alpha1
       kind: AppProject
@@ -229,6 +212,67 @@ write_files:
             selfHeal: true
     path: /root/argocd-apps.yaml
 
+  # MinIO deployment for Velero
+  - content: |
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: minio
+        namespace: velero
+      spec:
+        replicas: 1
+        selector:
+          matchLabels:
+            app: minio
+        template:
+          metadata:
+            labels:
+              app: minio
+          spec:
+            containers:
+              - name: minio
+                image: minio/minio:latest
+                command: ["minio", "server", "/data", "--console-address", ":9001"]
+                env:
+                  - name: MINIO_ROOT_USER
+                    value: "${minio_access_key}"
+                  - name: MINIO_ROOT_PASSWORD
+                    value: "${minio_secret_key}"
+                ports:
+                  - containerPort: 9000
+                  - containerPort: 9001
+                volumeMounts:
+                  - name: data
+                    mountPath: /data
+            volumes:
+              - name: data
+                emptyDir: {}
+      ---
+      apiVersion: v1
+      kind: Service
+      metadata:
+        name: minio
+        namespace: velero
+      spec:
+        selector:
+          app: minio
+        ports:
+          - name: api
+            port: 9000
+            targetPort: 9000
+          - name: console
+            port: 9001
+            targetPort: 9001
+    path: /root/minio.yaml
+
+  # Velero credentials
+  - content: |
+      [default]
+      aws_access_key_id = ${minio_access_key}
+      aws_secret_access_key = ${minio_secret_key}
+    path: /root/credentials-velero
+    permissions: '0600'
+
   - content: |
       #!/bin/bash
       export KUBECONFIG=/root/.kube/config
@@ -266,6 +310,16 @@ write_files:
       kubectl get applications -n argocd
       echo ""
 
+      echo "=== Rook-Ceph ==="
+      kubectl get pods -n rook-ceph --no-headers | head -10
+      echo "... ($(kubectl get pods -n rook-ceph --no-headers 2>/dev/null | wc -l) pods total)"
+      kubectl get cephcluster -n rook-ceph 2>/dev/null
+      echo ""
+
+      echo "=== Velero ==="
+      kubectl get pods -n velero --no-headers
+      echo ""
+
       echo "=== Grafana ==="
       kubectl get pods -n grafana 2>/dev/null || echo "  (pas encore déployé)"
       echo ""
@@ -273,32 +327,32 @@ write_files:
       echo "=== Prometheus ==="
       kubectl get pods -n monitoring 2>/dev/null || echo "  (pas encore déployé)"
       echo ""
-      
-      TRAEFIK_IP=$(kubectl get svc traefik -n traefik -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null)
-      if [ -n "$TRAEFIK_IP" ]; then
-        echo "=========================================="
-        echo "  ACCÈS AUX SERVICES"
-        echo "=========================================="
-        echo "  Traefik:     http://$TRAEFIK_IP"
-        echo "  Whoami:      http://$TRAEFIK_IP/whoami"
-        echo "  ArgoCD:      http://$TRAEFIK_IP/argocd/"
-        echo "  ArgoCD:      https://$TRAEFIK_IP/argocd/ (certificat auto-signé)"
-        echo "  Grafana:     http://$TRAEFIK_IP/grafana"
-        echo "  Prometheus:  http://$TRAEFIK_IP/prometheus"
-        echo ""
-        echo "  ArgoCD Login:"
-        echo "    Username: admin"
-        if [ -f /root/argocd-admin-password.txt ]; then
-          echo "    Password: $(cat /root/argocd-admin-password.txt)"
-        else
-          echo "    Password: kubectl get secret argocd-initial-admin-secret -n argocd -o jsonpath='{.data.password}' | base64 -d"
-        fi
-        echo ""
-        echo "  Grafana Login:"
-        echo "    Username: admin"
-        echo "    Password: admin (change au premier login)"
-        echo "=========================================="
+
+      echo "=========================================="
+      echo "  ACCÈS AUX SERVICES (DNS)"
+      echo "=========================================="
+      echo "  Whoami:      http://whoami.mpms.lab"
+      echo "  ArgoCD:      http://argocd.mpms.lab"
+      echo "  ArgoCD:      https://argocd.mpms.lab (certificat auto-signé)"
+      echo "  Grafana:     http://grafana.mpms.lab"
+      echo "  Prometheus:  http://prometheus.mpms.lab"
+      echo ""
+      echo "  ArgoCD Login:"
+      echo "    Username: admin"
+      if [ -f /root/argocd-admin-password.txt ]; then
+        echo "    Password: $(cat /root/argocd-admin-password.txt)"
+      else
+        echo "    Password: kubectl get secret argocd-initial-admin-secret -n argocd -o jsonpath='{.data.password}' | base64 -d"
       fi
+      echo ""
+      echo "  Grafana Login:"
+      echo "    Username: admin"
+      echo "    Password: admin (change au premier login)"
+      echo ""
+      echo "  Velero:"
+      echo "    velero backup create <name> --default-volumes-to-fs-backup"
+      echo "    velero backup get"
+      echo "=========================================="
     path: /root/check-cluster.sh
     permissions: '0755'
 
@@ -334,6 +388,12 @@ runcmd:
     echo "$JOIN_CMD" > /root/join-worker.sh
     echo "$JOIN_CMD --control-plane --certificate-key $CERT_KEY" > /root/join-cp.sh
     chmod +x /root/join-worker.sh /root/join-cp.sh
+  # Libérer Terraform (les services s'installent après)
+  - touch /root/cloud-init-complete
+  # ====================================================
+  # INSTALLATION DES SERVICES KUBERNETES
+  # (après cloud-init-complete pour ne pas bloquer Terraform)
+  # ====================================================
   # Cilium CNI
   - |
     export KUBECONFIG=/root/.kube/config
@@ -417,7 +477,7 @@ runcmd:
     helm repo add argo https://argoproj.github.io/argo-helm
     helm repo update
     helm install argocd argo/argo-cd --namespace argocd --values /root/argocd-values.yaml --wait --timeout 10m
-  # ArgoCD IngressRoutes
+  # ArgoCD IngressRoutes - host-based
   - |
     export KUBECONFIG=/root/.kube/config
     cat <<'ARGOEOF' | kubectl apply -f -
@@ -431,7 +491,7 @@ runcmd:
         - web
       routes:
         - kind: Rule
-          match: PathPrefix(`/argocd`)
+          match: Host(`argocd.mpms.lab`)
           services:
             - name: argocd-server
               port: 80
@@ -446,7 +506,7 @@ runcmd:
         - websecure
       routes:
         - kind: Rule
-          match: PathPrefix(`/argocd`)
+          match: Host(`argocd.mpms.lab`)
           services:
             - name: argocd-server
               port: 80
@@ -468,19 +528,12 @@ runcmd:
     done
   - curl -sSL -o /usr/local/bin/argocd https://github.com/argoproj/argo-cd/releases/latest/download/argocd-linux-amd64
   - chmod +x /usr/local/bin/argocd
-  # ====================================================
   # BOOTSTRAP ARGOCD GITOPS
-  # 1. Secret avec PAT GitHub pour repo privé
-  # 2. Applications ArgoCD (Grafana, Prometheus, KSM)
-  # 3. Nettoyage du fichier contenant le PAT
-  # ====================================================
   - |
     export KUBECONFIG=/root/.kube/config
-    echo "Configuration des credentials du repo privé GitHub..."
     kubectl apply -f /root/argocd-repo-creds.yaml
   - |
     export KUBECONFIG=/root/.kube/config
-    echo "Déploiement des ArgoCD Applications..."
     idx=0
     while [ $idx -lt 10 ]; do
       if kubectl apply -f /root/argocd-apps.yaml; then
@@ -490,20 +543,73 @@ runcmd:
       idx=$((idx+1))
       sleep 15
     done
-  # Nettoyage du PAT du disque (sécurité)
   - rm -f /root/argocd-repo-creds.yaml
   # Préparer le stockage local pour Grafana
   - mkdir -p /var/lib/grafana
   - chown 472:472 /var/lib/grafana
   - chmod 755 /var/lib/grafana
-  # Rafraîchir les routes Traefik
+  # ====================================================
+  # ROOK-CEPH : Stockage distribué
+  # Utilise les volumes vdb attachés aux workers (20 Go)
+  # ====================================================
   - |
     export KUBECONFIG=/root/.kube/config
-    TRAEFIK_IP=$(kubectl get svc traefik -n traefik -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null)
-    if [ -n "$TRAEFIK_IP" ]; then
-      sleep 10
-      curl -s -o /dev/null http://$TRAEFIK_IP/whoami || true
-      curl -s -o /dev/null http://$TRAEFIK_IP/argocd/ || true
-      curl -sk -o /dev/null https://$TRAEFIK_IP/argocd/ || true
-    fi
-  - touch /root/cloud-init-complete
+    echo "Installation de Rook-Ceph..."
+    git clone --branch v1.15.2 https://github.com/rook/rook.git /root/rook
+    cd /root/rook/deploy/examples
+    kubectl create -f common.yaml -f crds.yaml -f operator.yaml
+  - |
+    export KUBECONFIG=/root/.kube/config
+    echo "Attente du démarrage de l'opérateur Rook..."
+    kubectl -n rook-ceph wait --for=condition=available deployment/rook-ceph-operator --timeout=300s || sleep 60
+  - |
+    export KUBECONFIG=/root/.kube/config
+    echo "Création du CephCluster..."
+    cat <<'CEPHEOF' | kubectl apply -f -
+    apiVersion: ceph.rook.io/v1
+    kind: CephCluster
+    metadata:
+      name: rook-ceph
+      namespace: rook-ceph
+    spec:
+      cephVersion:
+        image: quay.io/ceph/ceph:v18.2.4
+      dataDirHostPath: /var/lib/rook
+      mon:
+        count: 3
+      mgr:
+        count: 1
+      storage:
+        useAllNodes: true
+        useAllDevices: false
+        deviceFilter: "^vdb"
+    CEPHEOF
+  # ====================================================
+  # VELERO + MINIO : Backup du cluster
+  # ====================================================
+  - |
+    export KUBECONFIG=/root/.kube/config
+    echo "Installation de Velero CLI..."
+    wget -q https://github.com/vmware-tanzu/velero/releases/download/v1.15.0/velero-v1.15.0-linux-amd64.tar.gz
+    tar -xzf velero-v1.15.0-linux-amd64.tar.gz
+    mv velero-v1.15.0-linux-amd64/velero /usr/local/bin/
+    rm -rf velero-v1.15.0-linux-amd64*
+  - |
+    export KUBECONFIG=/root/.kube/config
+    echo "Installation de Velero dans le cluster..."
+    velero install \
+      --provider aws \
+      --plugins velero/velero-plugin-for-aws:v1.9.2 \
+      --bucket velero \
+      --secret-file /root/credentials-velero \
+      --use-node-agent \
+      --backup-location-config region=minio,s3ForcePathStyle="true",s3Url=http://minio.velero.svc:9000 \
+      --use-volume-snapshots=false \
+      --wait
+  - |
+    export KUBECONFIG=/root/.kube/config
+    echo "Déploiement de MinIO..."
+    kubectl apply -f /root/minio.yaml
+    kubectl -n velero wait --for=condition=ready pod -l app=minio --timeout=120s || true
+    kubectl -n velero exec deploy/minio -- mkdir -p /data/velero || true
+  - rm -f /root/credentials-velero
