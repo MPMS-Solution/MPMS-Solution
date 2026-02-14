@@ -210,6 +210,26 @@ write_files:
           automated:
             prune: true
             selfHeal: true
+      ---
+      apiVersion: argoproj.io/v1alpha1
+      kind: Application
+      metadata:
+        name: pihole
+        namespace: argocd
+      spec:
+        project: monitoring
+        source:
+          repoURL: https://github.com/PierreJaloghlian/SAE_Cloud_Openstack.git
+          targetRevision: main
+          path: pihole
+        destination:
+          server: https://kubernetes.default.svc
+        syncPolicy:
+          automated:
+            prune: true
+            selfHeal: true
+          syncOptions:
+            - CreateNamespace=true
     path: /root/argocd-apps.yaml
 
   # MinIO deployment for Velero
@@ -328,6 +348,12 @@ write_files:
       kubectl get pods -n monitoring 2>/dev/null || echo "  (pas encore déployé)"
       echo ""
 
+      echo "=== Pi-hole ==="
+      kubectl get pods -n pihole 2>/dev/null || echo "  (pas encore déployé)"
+      PIHOLE_IP=$(kubectl get svc pihole-dns -n pihole -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null)
+      echo "  DNS IP: $${PIHOLE_IP:-pending}"
+      echo ""
+
       echo "=========================================="
       echo "  ACCÈS AUX SERVICES (DNS)"
       echo "=========================================="
@@ -336,6 +362,9 @@ write_files:
       echo "  ArgoCD:      https://argocd.mpms.lab (certificat auto-signé)"
       echo "  Grafana:     http://grafana.mpms.lab"
       echo "  Prometheus:  http://prometheus.mpms.lab"
+      echo "  Pi-hole:     http://pihole.mpms.lab"
+      echo "  Pi-hole DNS: $${PIHOLE_IP:-10.202.20.11} (port 53)"
+      echo "  Pi-hole Login: admin / admin"
       echo ""
       echo "  ArgoCD Login:"
       echo "    Username: admin"

@@ -82,6 +82,26 @@ resource "openstack_networking_secgroup_rule_v2" "icmp_rule" {
   security_group_id = openstack_networking_secgroup_v2.k8s_secgroup.id
 }
 
+resource "openstack_networking_secgroup_rule_v2" "dns_tcp_rule" {
+  direction         = "ingress"
+  ethertype         = "IPv4"
+  protocol          = "tcp"
+  port_range_min    = 53
+  port_range_max    = 53
+  remote_ip_prefix  = "0.0.0.0/0"
+  security_group_id = openstack_networking_secgroup_v2.k8s_secgroup.id
+}
+
+resource "openstack_networking_secgroup_rule_v2" "dns_udp_rule" {
+  direction         = "ingress"
+  ethertype         = "IPv4"
+  protocol          = "udp"
+  port_range_min    = 53
+  port_range_max    = 53
+  remote_ip_prefix  = "0.0.0.0/0"
+  security_group_id = openstack_networking_secgroup_v2.k8s_secgroup.id
+}
+
 # --- PORTS ---
 resource "openstack_networking_port_v2" "cp_ports" {
   count              = var.cp_count
