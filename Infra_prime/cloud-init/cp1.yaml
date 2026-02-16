@@ -230,6 +230,47 @@ write_files:
             selfHeal: true
           syncOptions:
             - CreateNamespace=true
+      ---
+      apiVersion: argoproj.io/v1alpha1
+      kind: Application
+      metadata:
+        name: uptime-kuma
+        namespace: argocd
+      spec:
+        project: monitoring
+        source:
+          repoURL: https://github.com/PierreJaloghlian/SAE_Cloud_Openstack.git
+          targetRevision: main
+          path: uptime-kuma
+        destination:
+          server: https://kubernetes.default.svc
+        syncPolicy:
+          automated:
+            prune: true
+            selfHeal: true
+          syncOptions:
+            - CreateNamespace=true
+      ---
+      apiVersion: argoproj.io/v1alpha1
+      kind: Application
+      metadata:
+        name: ceph-dashboard
+        namespace: argocd
+      spec:
+        project: monitoring
+        source:
+          repoURL: https://github.com/PierreJaloghlian/SAE_Cloud_Openstack.git
+          targetRevision: main
+          path: ceph-dashboard
+        destination:
+          server: https://kubernetes.default.svc
+        syncPolicy:
+          automated:
+            prune: true
+            selfHeal: true
+          syncOptions:
+            - CreateNamespace=true
+
     path: /root/argocd-apps.yaml
 
   # MinIO deployment for Velero
@@ -354,17 +395,27 @@ write_files:
       echo "  DNS IP: $${PIHOLE_IP:-pending}"
       echo ""
 
+      echo "=== Uptime Kuma ==="
+      kubectl get pods -n uptime-kuma 2>/dev/null || echo "  (pas encore déployé)"
+      echo ""
+
+      echo "=== Ceph Dashboard ==="
+      kubectl get svc -n rook-ceph rook-ceph-mgr-dashboard 2>/dev/null || echo "  (pas encore déployé)"
+      echo ""
+
       echo "=========================================="
       echo "  ACCÈS AUX SERVICES (DNS)"
       echo "=========================================="
-      echo "  Whoami:      http://whoami.mpms.lab"
-      echo "  ArgoCD:      http://argocd.mpms.lab"
-      echo "  ArgoCD:      https://argocd.mpms.lab (certificat auto-signé)"
-      echo "  Grafana:     http://grafana.mpms.lab"
-      echo "  Prometheus:  http://prometheus.mpms.lab"
-      echo "  Pi-hole:     http://pihole.mpms.lab"
-      echo "  Pi-hole DNS: $${PIHOLE_IP:-10.202.20.11} (port 53)"
-      echo "  Pi-hole Login: admin / admin"
+      echo "  Whoami:         http://whoami.mpms.lab"
+      echo "  ArgoCD:         http://argocd.mpms.lab"
+      echo "  ArgoCD:         https://argocd.mpms.lab (certificat auto-signé)"
+      echo "  Grafana:        http://grafana.mpms.lab"
+      echo "  Prometheus:     http://prometheus.mpms.lab"
+      echo "  Pi-hole:        http://pihole.mpms.lab"
+      echo "  Uptime Kuma:    http://status.mpms.lab"
+      echo "  Ceph Dashboard: http://ceph.mpms.lab"
+      echo "  Pi-hole DNS:    $${PIHOLE_IP:-10.202.20.11} (port 53)"
+      echo "  Pi-hole Login:  admin / admin"
       echo ""
       echo "  ArgoCD Login:"
       echo "    Username: admin"
@@ -378,8 +429,12 @@ write_files:
       echo "    Username: admin"
       echo "    Password: admin (change au premier login)"
       echo ""
+      echo "  Ceph Dashboard Login:"
+      echo "    Username: admin"
+      echo "    Password: kubectl -n rook-ceph get secret rook-ceph-dashboard-password -o jsonpath='{.data.password}' | base64 -d"
+      echo ""
       echo "  Velero:"
-      echo "    velero backup create <name> --default-volumes-to-fs-backup"
+      echo "    velero backup create <n> --default-volumes-to-fs-backup"
       echo "    velero backup get"
       echo "=========================================="
     path: /root/check-cluster.sh
@@ -499,6 +554,146 @@ runcmd:
       idx=$((idx+1))
       sleep 5
     done
+      # Attendre que tous les workers aient rejoint le cluster avant Rook
+  - |
+    export KUBECONFIG=/root/.kube/config
+    echo "Attente que les nodes soient Ready (minimum 4 = 1 CP + 3 workers)..."
+    idx=0
+    while [ $idx -lt 60 ]; do
+      READY=$(kubectl get nodes --no-headers 2>/dev/null | grep -c " Ready")
+      echo "  Nodes Ready: $READY/4 (tentative $idx/60)"
+      if [ "$READY" -ge 4 ]; then
+        echo "Tous les nodes sont Ready!"
+        break
+      fi
+      idx=$((idx+1))
+      sleep 15
+    done
+  # ====================================================
+  # ROOK-CEPH : Stockage distribué et Dashboard
+  # (AVANT ArgoCD apps pour que la StorageClass soit prête)
+  # ====================================================
+  - |
+    export KUBECONFIG=/root/.kube/config
+    echo "Installation de Rook-Ceph..."
+    git clone --branch v1.15.2 https://github.com/rook/rook.git /root/rook
+    cd /root/rook/deploy/examples
+    kubectl create -f common.yaml -f crds.yaml -f operator.yaml
+  - |
+    export KUBECONFIG=/root/.kube/config
+    echo "Attente du démarrage de l'opérateur Rook..."
+    kubectl -n rook-ceph wait --for=condition=available deployment/rook-ceph-operator --timeout=300s
+  - |
+    export KUBECONFIG=/root/.kube/config
+    echo "Création du CephCluster..."
+    cat <<'CEPHEOF' | kubectl apply -f -
+    apiVersion: ceph.rook.io/v1
+    kind: CephCluster
+    metadata:
+      name: rook-ceph
+      namespace: rook-ceph
+    spec:
+      cephVersion:
+        image: quay.io/ceph/ceph:v18.2.4
+      dataDirHostPath: /var/lib/rook
+      mon:
+        count: 3
+      mgr:
+        count: 1
+      dashboard:
+        enabled: true
+        ssl: true
+      storage:
+        useAllNodes: true
+        useAllDevices: false
+        deviceFilter: "^vdb"
+    CEPHEOF
+  - |
+    # Attente que le CephCluster soit READY avant de continuer
+    export KUBECONFIG=/root/.kube/config
+    echo "Attente que le CephCluster soit Ready (peut prendre 5-10 min)..."
+    idx=0
+    while [ $idx -lt 60 ]; do
+      PHASE=$(kubectl get cephcluster rook-ceph -n rook-ceph -o jsonpath='{.status.phase}' 2>/dev/null)
+      HEALTH=$(kubectl get cephcluster rook-ceph -n rook-ceph -o jsonpath='{.status.ceph.health}' 2>/dev/null)
+      echo "  CephCluster phase=$PHASE health=$HEALTH (tentative $idx/60)"
+      if [ "$PHASE" = "Ready" ]; then
+        echo "CephCluster est Ready!"
+        break
+      fi
+      idx=$((idx+1))
+      sleep 15
+    done
+  - |
+    # CONFIGURATION DU STOCKAGE (StorageClass + Pool)
+    export KUBECONFIG=/root/.kube/config
+    echo "Création du CephBlockPool et de la StorageClass..."
+    cat <<'SCEOF' | kubectl apply -f -
+    apiVersion: ceph.rook.io/v1
+    kind: CephBlockPool
+    metadata:
+      name: replicapool
+      namespace: rook-ceph
+    spec:
+      failureDomain: host
+      replicated:
+        size: 3
+    ---
+    apiVersion: storage.k8s.io/v1
+    kind: StorageClass
+    metadata:
+      name: rook-ceph-block
+    provisioner: rook-ceph.rbd.csi.ceph.com
+    parameters:
+      clusterID: rook-ceph
+      pool: replicapool
+      imageFormat: "2"
+      imageFeatures: layering
+      csi.storage.k8s.io/provisioner-secret-name: rook-csi-rbd-provisioner
+      csi.storage.k8s.io/provisioner-secret-namespace: rook-ceph
+      csi.storage.k8s.io/node-stage-secret-name: rook-csi-rbd-node
+      csi.storage.k8s.io/node-stage-secret-namespace: rook-ceph
+    reclaimPolicy: Delete
+    allowVolumeExpansion: true
+    SCEOF
+  - |
+    # Vérifier que les secrets CSI existent (nécessaires pour le provisioning PVC)
+    export KUBECONFIG=/root/.kube/config
+    echo "Attente des secrets CSI Rook..."
+    idx=0
+    while [ $idx -lt 30 ]; do
+      if kubectl get secret rook-csi-rbd-provisioner -n rook-ceph > /dev/null 2>&1 && \
+         kubectl get secret rook-csi-rbd-node -n rook-ceph > /dev/null 2>&1; then
+        echo "Secrets CSI prêts!"
+        break
+      fi
+      echo "  Attente des secrets CSI... (tentative $idx/30)"
+      idx=$((idx+1))
+      sleep 10
+    done
+  - |
+    # Vérifier que le dashboard Ceph est accessible
+    export KUBECONFIG=/root/.kube/config
+    echo "Attente que le service dashboard Ceph soit prêt..."
+    idx=0
+    while [ $idx -lt 30 ]; do
+      ENDPOINTS=$(kubectl get endpoints rook-ceph-mgr-dashboard -n rook-ceph -o jsonpath='{.subsets[0].addresses[0].ip}' 2>/dev/null)
+      if [ -n "$ENDPOINTS" ]; then
+        echo "Dashboard Ceph a des endpoints actifs: $ENDPOINTS"
+        break
+      fi
+      echo "  Attente des endpoints dashboard... (tentative $idx/30)"
+      idx=$((idx+1))
+      sleep 10
+    done
+  # Préparer le stockage local pour Grafana
+  - mkdir -p /var/lib/grafana
+  - chown 472:472 /var/lib/grafana
+  - chmod 755 /var/lib/grafana
+  # ====================================================
+  # ARGOCD : Installation et Bootstrap GitOps
+  # (APRÈS Rook-Ceph pour que les PVC fonctionnent)
+  # ====================================================
   # ArgoCD install
   - |
     export KUBECONFIG=/root/.kube/config
@@ -573,46 +768,6 @@ runcmd:
       sleep 15
     done
   - rm -f /root/argocd-repo-creds.yaml
-  # Préparer le stockage local pour Grafana
-  - mkdir -p /var/lib/grafana
-  - chown 472:472 /var/lib/grafana
-  - chmod 755 /var/lib/grafana
-  # ====================================================
-  # ROOK-CEPH : Stockage distribué
-  # Utilise les volumes vdb attachés aux workers (20 Go)
-  # ====================================================
-  - |
-    export KUBECONFIG=/root/.kube/config
-    echo "Installation de Rook-Ceph..."
-    git clone --branch v1.15.2 https://github.com/rook/rook.git /root/rook
-    cd /root/rook/deploy/examples
-    kubectl create -f common.yaml -f crds.yaml -f operator.yaml
-  - |
-    export KUBECONFIG=/root/.kube/config
-    echo "Attente du démarrage de l'opérateur Rook..."
-    kubectl -n rook-ceph wait --for=condition=available deployment/rook-ceph-operator --timeout=300s || sleep 60
-  - |
-    export KUBECONFIG=/root/.kube/config
-    echo "Création du CephCluster..."
-    cat <<'CEPHEOF' | kubectl apply -f -
-    apiVersion: ceph.rook.io/v1
-    kind: CephCluster
-    metadata:
-      name: rook-ceph
-      namespace: rook-ceph
-    spec:
-      cephVersion:
-        image: quay.io/ceph/ceph:v18.2.4
-      dataDirHostPath: /var/lib/rook
-      mon:
-        count: 3
-      mgr:
-        count: 1
-      storage:
-        useAllNodes: true
-        useAllDevices: false
-        deviceFilter: "^vdb"
-    CEPHEOF
   # ====================================================
   # VELERO + MINIO : Backup du cluster
   # ====================================================
