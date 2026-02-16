@@ -270,6 +270,26 @@ write_files:
             selfHeal: true
           syncOptions:
             - CreateNamespace=true
+      ---
+      apiVersion: argoproj.io/v1alpha1
+      kind: Application
+      metadata:
+        name: vault
+        namespace: argocd
+      spec:
+        project: monitoring
+        source:
+          repoURL: https://github.com/PierreJaloghlian/SAE_Cloud_Openstack.git
+          targetRevision: main
+          path: vault
+        destination:
+          server: https://kubernetes.default.svc
+        syncPolicy:
+          automated:
+            prune: true
+            selfHeal: true
+          syncOptions:
+            - CreateNamespace=true
 
     path: /root/argocd-apps.yaml
 
@@ -403,6 +423,10 @@ write_files:
       kubectl get svc -n rook-ceph rook-ceph-mgr-dashboard 2>/dev/null || echo "  (pas encore déployé)"
       echo ""
 
+      echo "=== Vault ==="
+      kubectl get pods -n vault 2>/dev/null || echo "  (pas encore déployé)"
+      echo ""
+
       echo "=========================================="
       echo "  ACCÈS AUX SERVICES (DNS)"
       echo "=========================================="
@@ -414,6 +438,8 @@ write_files:
       echo "  Pi-hole:        http://pihole.mpms.lab"
       echo "  Uptime Kuma:    http://status.mpms.lab"
       echo "  Ceph Dashboard: http://ceph.mpms.lab"
+      echo "  Vault:          http://vault.mpms.lab"
+      echo "  Vault:          https://vault.mpms.lab"
       echo "  Pi-hole DNS:    $${PIHOLE_IP:-10.202.20.11} (port 53)"
       echo "  Pi-hole Login:  admin / admin"
       echo ""
@@ -432,6 +458,13 @@ write_files:
       echo "  Ceph Dashboard Login:"
       echo "    Username: admin"
       echo "    Password: kubectl -n rook-ceph get secret rook-ceph-dashboard-password -o jsonpath='{.data.password}' | base64 -d"
+      echo ""
+      echo "  Vault Login:"
+      if [ -f /root/vault-credentials.txt ]; then
+        echo "    Root Token: $(grep 'Root Token' /root/vault-credentials.txt | awk '{print $NF}')"
+      else
+        echo "    Voir /root/vault-credentials.txt après init"
+      fi
       echo ""
       echo "  Velero:"
       echo "    velero backup create <n> --default-volumes-to-fs-backup"
@@ -797,3 +830,96 @@ runcmd:
     kubectl -n velero wait --for=condition=ready pod -l app=minio --timeout=120s || true
     kubectl -n velero exec deploy/minio -- mkdir -p /data/velero || true
   - rm -f /root/credentials-velero
+  # ====================================================
+  # VAULT : Auto-initialisation et Unseal
+  # (APRÈS déploiement ArgoCD apps)
+  # ====================================================
+  - |
+    export KUBECONFIG=/root/.kube/config
+    echo "Attente du déploiement Vault par ArgoCD..."
+    idx=0
+    while [ $idx -lt 60 ]; do
+      if kubectl get deployment vault -n vault > /dev/null 2>&1; then
+        echo "Deployment Vault trouvé!"
+        break
+      fi
+      echo "  Attente du deployment Vault... (tentative $idx/60)"
+      idx=$((idx+1))
+      sleep 15
+    done
+  - |
+    export KUBECONFIG=/root/.kube/config
+    echo "Attente que le pod Vault soit Running..."
+    kubectl -n vault wait --for=condition=ready pod -l app=vault --timeout=300s || true
+    sleep 10
+  - |
+    export KUBECONFIG=/root/.kube/config
+    VAULT_POD=$(kubectl get pods -n vault -l app=vault -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+    if [ -z "$VAULT_POD" ]; then
+      echo "ERREUR: Aucun pod Vault trouvé, abandon de l'auto-init."
+      exit 0
+    fi
+
+    # Vérifier si Vault est déjà initialisé
+    INIT_STATUS=$(kubectl exec -n vault "$VAULT_POD" -- vault status -format=json 2>/dev/null | python3 -c "import sys,json; print(json.load(sys.stdin).get('initialized', False))" 2>/dev/null || echo "false")
+
+    if [ "$INIT_STATUS" = "True" ] || [ "$INIT_STATUS" = "true" ]; then
+      echo "Vault est déjà initialisé, vérification du seal status..."
+      SEALED=$(kubectl exec -n vault "$VAULT_POD" -- vault status -format=json 2>/dev/null | python3 -c "import sys,json; print(json.load(sys.stdin).get('sealed', True))" 2>/dev/null || echo "true")
+      if [ "$SEALED" = "False" ] || [ "$SEALED" = "false" ]; then
+        echo "Vault est déjà unseal, rien à faire."
+        exit 0
+      fi
+    fi
+
+    echo "Initialisation de Vault (3 key shares, threshold 2)..."
+    INIT_OUTPUT=$(kubectl exec -n vault "$VAULT_POD" -- vault operator init \
+      -key-shares=3 \
+      -key-threshold=2 \
+      -format=json 2>/dev/null)
+
+    if [ -z "$INIT_OUTPUT" ]; then
+      echo "ERREUR: Échec de l'initialisation Vault."
+      exit 0
+    fi
+
+    # Extraire les unseal keys et le root token
+    UNSEAL_KEY_1=$(echo "$INIT_OUTPUT" | python3 -c "import sys,json; print(json.load(sys.stdin)['unseal_keys_b64'][0])")
+    UNSEAL_KEY_2=$(echo "$INIT_OUTPUT" | python3 -c "import sys,json; print(json.load(sys.stdin)['unseal_keys_b64'][1])")
+    UNSEAL_KEY_3=$(echo "$INIT_OUTPUT" | python3 -c "import sys,json; print(json.load(sys.stdin)['unseal_keys_b64'][2])")
+    ROOT_TOKEN=$(echo "$INIT_OUTPUT" | python3 -c "import sys,json; print(json.load(sys.stdin)['root_token'])")
+
+    # Sauvegarder les credentials
+    cat > /root/vault-credentials.txt <<VAULTCREDS
+    ===================================
+     VAULT CREDENTIALS - À SÉCURISER !
+    ===================================
+     Unseal Key 1: $UNSEAL_KEY_1
+     Unseal Key 2: $UNSEAL_KEY_2
+     Unseal Key 3: $UNSEAL_KEY_3
+     Root Token:   $ROOT_TOKEN
+     Threshold:    2/3
+    ===================================
+    VAULTCREDS
+    chmod 600 /root/vault-credentials.txt
+    echo "Credentials sauvegardés dans /root/vault-credentials.txt"
+
+    # Unseal avec 2 des 3 keys (threshold = 2)
+    echo "Unseal de Vault (key 1/2)..."
+    kubectl exec -n vault "$VAULT_POD" -- vault operator unseal "$UNSEAL_KEY_1"
+    sleep 2
+
+    echo "Unseal de Vault (key 2/2)..."
+    kubectl exec -n vault "$VAULT_POD" -- vault operator unseal "$UNSEAL_KEY_2"
+    sleep 2
+
+    # Vérifier le statut final
+    echo "Statut final de Vault :"
+    kubectl exec -n vault "$VAULT_POD" -- vault status
+
+    echo ""
+    echo "=========================================="
+    echo " Vault initialisé et unseal avec succès !"
+    echo " Root Token : $ROOT_TOKEN"
+    echo " Credentials : /root/vault-credentials.txt"
+    echo "=========================================="
