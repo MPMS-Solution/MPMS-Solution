@@ -163,6 +163,8 @@ resource "openstack_compute_instance_v2" "cp" {
     github_pat       = var.github_pat
     minio_access_key = var.minio_access_key
     minio_secret_key = var.minio_secret_key
+    pihole_password  = var.pihole_password
+    grafana_password = var.grafana_password
     }) : templatefile("${path.module}/cloud-init/worker.yaml", {
     control_plane_ip = openstack_networking_port_v2.cp_ports[0].all_fixed_ips[0]
   })

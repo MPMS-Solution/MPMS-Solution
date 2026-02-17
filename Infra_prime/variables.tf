@@ -55,7 +55,7 @@ variable "metallb_ip_range" {
 variable "ssh_private_key_path" {
   description = "Chemin vers la cle privee SSH pour les provisioners"
   type        = string
-  default     = "/home/test/id_ed25519"
+  default     = "~/.ssh/id_ed25519"
 }
 
 variable "ssh_allowed_cidr" {
@@ -93,4 +93,18 @@ variable "minio_secret_key" {
   type        = string
   sensitive   = true
   default     = "minioadmin"
+}
+
+variable "pihole_password" {
+  description = "Mot de passe admin Pi-hole"
+  type        = string
+  sensitive   = true
+  default     = "admin"
+}
+
+variable "grafana_password" {
+  description = "Mot de passe admin Grafana"
+  type        = string
+  sensitive   = true
+  default     = "admin"
 }
