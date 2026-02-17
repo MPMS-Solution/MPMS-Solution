@@ -290,7 +290,7 @@ resource "null_resource" "wait_for_full_bootstrap" {
     user        = "ubuntu"
     private_key = file(var.ssh_private_key_path)
     host        = openstack_networking_port_v2.cp_ports[0].all_fixed_ips[0]
-    timeout     = "45m"
+    timeout     = "20m"
   }
 
   provisioner "remote-exec" {
