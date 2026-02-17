@@ -55,7 +55,7 @@ variable "metallb_ip_range" {
 variable "ssh_private_key_path" {
   description = "Chemin vers la cle privee SSH pour les provisioners"
   type        = string
-  default     = "~/.ssh/id_ed25519"
+  default     = "/home/test/id_ed25519"
 }
 
 variable "ssh_allowed_cidr" {
