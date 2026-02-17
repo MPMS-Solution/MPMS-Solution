@@ -17,3 +17,9 @@ output "ssh_command_cp1" {
   description = "Commande SSH pour se connecter au CP1"
   value       = "ssh ubuntu@${openstack_networking_port_v2.cp_ports[0].all_fixed_ips[0]}"
 }
+
+output "cluster_status" {
+  description = "Statut du bootstrap"
+  value       = "Cluster entièrement déployé. Exécuter 'sudo /root/check-cluster.sh' sur CP1 pour le détail."
+  depends_on  = [null_resource.wait_for_full_bootstrap]
+}

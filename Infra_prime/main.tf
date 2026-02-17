@@ -275,3 +275,36 @@ resource "null_resource" "worker_join" {
     command = "ssh -o StrictHostKeyChecking=no -i ${var.ssh_private_key_path} ubuntu@${openstack_networking_port_v2.cp_ports[0].all_fixed_ips[0]} 'sudo cat /root/join-worker.sh' | ssh -o StrictHostKeyChecking=no -i ${var.ssh_private_key_path} ubuntu@${openstack_networking_port_v2.worker_ports[count.index].all_fixed_ips[0]} 'sudo bash'"
   }
 }
+
+# --- ATTENTE BOOTSTRAP COMPLET ---
+# Attend que TOUT soit déployé (ArgoCD, Vault, ESO, etc.)
+# avant de marquer le terraform apply comme terminé
+resource "null_resource" "wait_for_full_bootstrap" {
+  depends_on = [
+    null_resource.cp_join,
+    null_resource.worker_join
+  ]
+
+  connection {
+    type        = "ssh"
+    user        = "ubuntu"
+    private_key = file(var.ssh_private_key_path)
+    host        = openstack_networking_port_v2.cp_ports[0].all_fixed_ips[0]
+    timeout     = "45m"
+  }
+
+  provisioner "remote-exec" {
+    inline = [
+      "echo '============================================'",
+      "echo ' Attente du bootstrap complet du cluster...'",
+      "echo ' (Cilium, Rook-Ceph, ArgoCD, Vault, ESO)'",
+      "echo '============================================'",
+      "while ! sudo test -f /root/bootstrap-complete; do echo \"  $(date +%H:%M:%S) - En cours...\"; sleep 30; done",
+      "echo ''",
+      "echo '============================================'",
+      "echo ' CLUSTER PRÊT !'",
+      "echo '============================================'",
+      "sudo /root/check-cluster.sh"
+    ]
+  }
+}

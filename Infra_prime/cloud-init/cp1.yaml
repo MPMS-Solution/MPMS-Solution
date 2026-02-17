@@ -1105,3 +1105,8 @@ runcmd:
     echo " Tous les secrets sont gérés par Vault"
     echo " Exécuter: /root/check-cluster.sh"
     echo "=========================================="
+  # ====================================================
+  # MARQUEUR FINAL : signaler que TOUT est prêt
+  # (utilisé par Terraform pour attendre la fin réelle)
+  # ====================================================
+  - touch /root/bootstrap-complete
